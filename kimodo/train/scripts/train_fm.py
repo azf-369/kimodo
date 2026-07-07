@@ -8,11 +8,13 @@ from __future__ import annotations
 import argparse
 import itertools
 import sys
+import time
 from pathlib import Path
 
 import torch
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from kimodo.model.flow_matching import FlowMatchingLoss
 from kimodo.train.build import build_denoiser, build_motion_rep
@@ -23,6 +25,16 @@ from kimodo.train.flow_train import flow_matching_batch_step
 from kimodo.train.stats_compute import compute_motion_stats, save_motion_stats
 from kimodo.train.text_embedding import TextEmbeddingProvider
 from kimodo.train.utils import apply_no_text_overrides, load_train_config
+
+
+def _format_duration(seconds: float) -> str:
+    """Format seconds as HhMMmSSs or MmSSs."""
+    total = max(0, int(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{secs:02d}s"
+    return f"{minutes}m{secs:02d}s"
 
 
 def parse_args() -> argparse.Namespace:
@@ -160,14 +172,19 @@ def main() -> int:
 
     denoiser.train()
     text_tokens = denoiser.root_model.num_text_tokens
+    max_steps = int(train_cfg.max_steps)
+    log_every = int(train_cfg.log_every)
     print(
         f"Device: {device} | clips: {len(dataset)} | feat_dim: {motion_rep.motion_rep_dim} "
-        f"| max_steps: {train_cfg.max_steps} | text_mode: {args.text_mode} "
+        f"| max_steps: {max_steps} | text_mode: {args.text_mode} "
         f"| no_text: {args.no_text} | text_tokens: {text_tokens} "
         f"| num_workers: {train_cfg.num_workers}"
     )
 
-    for step in range(1, int(train_cfg.max_steps) + 1):
+    start_time = time.perf_counter()
+    progress = tqdm(range(1, max_steps + 1), desc="Training", unit="step", dynamic_ncols=True)
+
+    for step in progress:
         batch = next(data_iter)
         optimizer.zero_grad(set_to_none=True)
         loss, metrics = flow_matching_batch_step(
@@ -182,19 +199,31 @@ def main() -> int:
         )
 
         if not torch.isfinite(loss):
-            print(f"ERROR: non-finite loss at step {step}: {loss.item()}", file=sys.stderr)
+            tqdm.write(f"ERROR: non-finite loss at step {step}: {loss.item()}")
             return 1
 
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(denoiser.parameters(), train_cfg.grad_clip)
         optimizer.step()
 
-        if step % int(train_cfg.log_every) == 0 or step == 1:
-            print(
-                f"step {step}/{train_cfg.max_steps} "
+        elapsed = time.perf_counter() - start_time
+        eta = elapsed / step * (max_steps - step)
+
+        if step % log_every == 0 or step == 1:
+            progress.set_postfix(
+                loss=f"{metrics['loss'].item():.4f}",
+                grad=f"{float(grad_norm):.4f}",
+                elapsed=_format_duration(elapsed),
+                eta=_format_duration(eta),
+                refresh=False,
+            )
+            tqdm.write(
+                f"step {step}/{max_steps} "
                 f"loss={metrics['loss'].item():.6f} "
                 f"t_mean={metrics['t_mean'].item():.3f} "
-                f"grad_norm={float(grad_norm):.4f}"
+                f"grad_norm={float(grad_norm):.4f} "
+                f"elapsed={_format_duration(elapsed)} "
+                f"eta={_format_duration(eta)}"
             )
 
         if step % int(train_cfg.save_every) == 0:
@@ -206,7 +235,10 @@ def main() -> int:
                 stats_dir=stats_workdir,
             )
             denoiser.to(device).train()
-            print(f"saved checkpoint to {ckpt_dir}")
+            tqdm.write(f"saved checkpoint to {ckpt_dir}")
+
+    total_time = time.perf_counter() - start_time
+    print(f"Training completed in {_format_duration(total_time)}")
 
     denoiser.eval()
     with torch.no_grad():
