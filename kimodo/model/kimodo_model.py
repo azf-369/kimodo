@@ -18,6 +18,7 @@ from kimodo.tools import to_numpy
 
 from .cfg import ClassifierFreeGuidedModel
 from .diffusion import DDIMSampler, Diffusion
+from .flow_matching import EulerODESolver, apply_motion_constraints
 
 log = logging.getLogger(__name__)
 
@@ -32,9 +33,11 @@ class Kimodo(nn.Module):
         num_base_steps: int,
         device: Optional[Union[str, torch.device]] = None,
         cfg_type: Optional[str] = "separated",
+        generative_paradigm: str = "diffusion",
     ):
         super().__init__()
 
+        self.generative_paradigm = generative_paradigm
         self.denoiser = denoiser.eval()
 
         if cfg_type is None:
@@ -48,8 +51,14 @@ class Kimodo(nn.Module):
 
         self.fps = denoiser.motion_rep.fps
 
-        self.diffusion = Diffusion(num_base_steps=num_base_steps)
-        self.sampler = DDIMSampler(self.diffusion)
+        if generative_paradigm == "flow_matching":
+            self.diffusion = None
+            self.sampler = None
+            self.flow_solver = EulerODESolver()
+        else:
+            self.diffusion = Diffusion(num_base_steps=num_base_steps)
+            self.sampler = DDIMSampler(self.diffusion)
+            self.flow_solver = None
         self.text_encoder = text_encoder
 
         self.device = device
@@ -119,6 +128,70 @@ class Kimodo(nn.Module):
         # sampler computes next step noisy motion
         x_tm1 = self.sampler(use_timesteps, motion, pred_clean, t)
         return x_tm1
+
+    def _encode_text_or_zeros(
+        self,
+        texts: List[str],
+        device: torch.device,
+        text_feat: Optional[torch.Tensor] = None,
+        text_pad_mask: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if text_feat is not None:
+            assert text_pad_mask is not None
+            return text_feat, text_pad_mask
+
+        batch_size = len(texts)
+        if self.text_encoder is not None:
+            log.info("Encoding text...")
+            text_feat, text_length = self.text_encoder(texts)
+            text_feat = text_feat.to(device)
+
+            empty_text_mask = [len(text.strip()) == 0 for text in texts]
+            text_feat[empty_text_mask] = 0
+
+            maxlen = text_feat.shape[1]
+            tensor_text_length = torch.tensor(text_length, device=device)
+            tensor_text_length[empty_text_mask] = 0
+            text_pad_mask = torch.arange(maxlen, device=device).expand(batch_size, maxlen) < tensor_text_length[:, None]
+            return text_feat, text_pad_mask
+
+        root_model = self.denoiser.model.root_model
+        num_tokens = root_model.num_text_tokens
+        llm_dim = root_model.embed_text.in_features
+        text_feat = torch.zeros(batch_size, num_tokens, llm_dim, device=device)
+        text_pad_mask = torch.zeros(batch_size, num_tokens, dtype=torch.bool, device=device)
+        return text_feat, text_pad_mask
+
+    def integration_step(
+        self,
+        motion: torch.Tensor,
+        pad_mask: torch.Tensor,
+        text_feat: torch.Tensor,
+        text_pad_mask: torch.Tensor,
+        t: torch.Tensor,
+        first_heading_angle: Optional[torch.Tensor],
+        motion_mask: torch.Tensor,
+        observed_motion: torch.Tensor,
+        dt: float,
+        cfg_weight: Union[float, Tuple[float, float]],
+        cfg_type: Optional[str] = None,
+    ) -> torch.Tensor:
+        """Single Euler step for flow matching (predict velocity, integrate backward in t)."""
+        motion = apply_motion_constraints(motion, motion_mask, observed_motion)
+        with torch.inference_mode():
+            velocity = self.denoiser(
+                cfg_weight,
+                motion,
+                pad_mask,
+                text_feat,
+                text_pad_mask,
+                t,
+                first_heading_angle,
+                motion_mask,
+                observed_motion,
+                cfg_type=cfg_type,
+            )
+        return motion - dt * velocity
 
     def _multiprompt(
         self,
@@ -582,21 +655,7 @@ class Kimodo(nn.Module):
         """
 
         device = self.device
-        if text_feat is None:
-            assert text_pad_mask is None
-            log.info("Encoding text...")
-            text_feat, text_length = self.text_encoder(texts)
-            text_feat = text_feat.to(device)
-
-            # handle empty string (set to zero)
-            empty_text_mask = [len(text.strip()) == 0 for text in texts]
-            text_feat[empty_text_mask] = 0
-
-            # Create the pad mask for the text
-            batch_size, maxlen = text_feat.shape[:2]
-            tensor_text_length = torch.tensor(text_length, device=device)
-            tensor_text_length[empty_text_mask] = 0
-            text_pad_mask = torch.arange(maxlen, device=device).expand(batch_size, maxlen) < tensor_text_length[:, None]
+        text_feat, text_pad_mask = self._encode_text_or_zeros(texts, device, text_feat, text_pad_mask)
 
         if motion_mask is not None:
             if motion_mask.dtype == torch.bool:
@@ -604,7 +663,23 @@ class Kimodo(nn.Module):
 
         batch_size = text_feat.shape[0]
 
-        # sample loop
+        if self.generative_paradigm == "flow_matching":
+            return self._generate_flow_matching(
+                batch_size=batch_size,
+                max_frames=max_frames,
+                num_steps=num_denoising_steps,
+                pad_mask=pad_mask,
+                text_feat=text_feat,
+                text_pad_mask=text_pad_mask,
+                first_heading_angle=first_heading_angle,
+                motion_mask=motion_mask,
+                observed_motion=observed_motion,
+                cfg_weight=cfg_weight,
+                cfg_type=cfg_type,
+                progress_bar=progress_bar,
+            )
+
+        # sample loop (diffusion / DDIM)
         indices = list(range(num_denoising_steps))[::-1]
         shape = (batch_size, max_frames, self.motion_rep.motion_rep_dim)
         cur_mot = torch.randn(shape, device=self.device)
@@ -629,6 +704,45 @@ class Kimodo(nn.Module):
                     num_denoising_steps,
                     cfg_weight,
                     guide_masks=guide_masks,
+                    cfg_type=cfg_type,
+                )
+        return cur_mot
+
+    def _generate_flow_matching(
+        self,
+        batch_size: int,
+        max_frames: int,
+        num_steps: int,
+        pad_mask: torch.Tensor,
+        text_feat: torch.Tensor,
+        text_pad_mask: torch.Tensor,
+        first_heading_angle: Optional[torch.Tensor],
+        motion_mask: torch.Tensor,
+        observed_motion: torch.Tensor,
+        cfg_weight: Union[float, Tuple[float, float]],
+        cfg_type: Optional[str] = None,
+        progress_bar=tqdm,
+    ) -> torch.Tensor:
+        shape = (batch_size, max_frames, self.motion_rep.motion_rep_dim)
+        cur_mot = torch.randn(shape, device=self.device)
+        dt = 1.0 / num_steps
+        indices = list(range(num_steps))
+
+        for i in progress_bar(indices):
+            t_val = 1.0 - i * dt
+            t = torch.full((batch_size,), t_val, device=self.device, dtype=cur_mot.dtype)
+            with torch.inference_mode():
+                cur_mot = self.integration_step(
+                    cur_mot,
+                    pad_mask,
+                    text_feat,
+                    text_pad_mask,
+                    t,
+                    first_heading_angle,
+                    motion_mask,
+                    observed_motion,
+                    dt,
+                    cfg_weight,
                     cfg_type=cfg_type,
                 )
         return cur_mot

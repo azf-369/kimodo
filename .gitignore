@@ -158,3 +158,9 @@ onelogger.err
 
 # deploy files
 /helm-library
+
+# logs
+devlog/logs
+
+# Checkpoints
+checkpoints

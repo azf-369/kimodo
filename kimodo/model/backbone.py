@@ -3,6 +3,7 @@
 """Transformer backbone: padding, masking, and encoder stack for the denoiser."""
 
 import logging
+import math
 from typing import Optional, Union
 
 import torch
@@ -304,9 +305,14 @@ class TimestepEmbedder(nn.Module):
         """Embed timesteps by adding PE then going through linear layers.
 
         Args:
-            timesteps (torch.Tensor): [B]
+            timesteps (torch.Tensor): [B] discrete indices or continuous t in [0, 1]
 
         Returns:
             torch.Tensor: [B, 1, D]
         """
-        return self.time_embed(self.sequence_pos_encoder.pe.transpose(0, 1)[timesteps])
+        if timesteps.is_floating_point():
+            from .flow_matching import sinusoidal_timestep_embedding
+
+            emb = sinusoidal_timestep_embedding(timesteps, self.latent_dim)
+            return self.time_embed(emb).unsqueeze(1)
+        return self.time_embed(self.sequence_pos_encoder.pe.transpose(0, 1)[timesteps.long()])

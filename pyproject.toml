@@ -43,6 +43,11 @@ all = [
   "viser @ git+https://github.com/nv-tlabs/kimodo-viser.git",
   "py-soma-x @ git+https://github.com/NVlabs/SOMA-X.git"
 ]
+train = [
+  "torchcfm>=1.0",
+  "pandas>=2.0",
+  "pyarrow>=14.0",
+]
 
 [project.scripts]
 kimodo_gen = "kimodo.scripts.generate:main"

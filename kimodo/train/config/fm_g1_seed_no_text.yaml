@@ -1,0 +1,11 @@
+# No-text training overrides (also applied automatically by train_fm.py --no-text).
+denoiser:
+  num_text_tokens_override: 0
+
+cfg_type: nocfg
+
+training:
+  cfg_dropout:
+    uncond: 0.1
+    text_only: 0.0
+    constraint_only: 0.0
