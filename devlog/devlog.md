@@ -180,6 +180,23 @@ python -m kimodo.train.scripts.train_fm \
   --split-path datasets/kimodo-benchmark/splits/train_split_paths.txt \
   --output-dir outputs/fm_g1_seed_no_text \
   --device cuda
+
+# 增加wandb训练图片绘制：
+uv pip install wandb
+# 或
+uv pip install -e ".[train]"
+
+wandb login
+
+python -m kimodo.train.scripts.train_fm \
+  --no-text \
+  --data-root datasets/bones-seed \
+  --split-path datasets/kimodo-benchmark/splits/train_split_paths.txt \
+  --output-dir outputs/fm_g1_seed_no_text \
+  --device cuda \
+  --wandb \
+  --wandb-project kimodo-fm-g1 \
+  --wandb-run-name g1-notext-local
 ```
 
 

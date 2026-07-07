@@ -47,6 +47,7 @@ train = [
   "torchcfm>=1.0",
   "pandas>=2.0",
   "pyarrow>=14.0",
+  "wandb>=0.16",
 ]
 
 [project.scripts]

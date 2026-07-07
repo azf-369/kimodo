@@ -25,6 +25,7 @@ from kimodo.train.flow_train import flow_matching_batch_step
 from kimodo.train.stats_compute import compute_motion_stats, save_motion_stats
 from kimodo.train.text_embedding import TextEmbeddingProvider
 from kimodo.train.utils import apply_no_text_overrides, load_train_config
+from kimodo.train.wandb_log import WandbLogger
 
 
 def _format_duration(seconds: float) -> str:
@@ -62,6 +63,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--compute-stats", action="store_true", help="Recompute stats from training data.")
     parser.add_argument("--stats-batches", type=int, default=50, help="Max batches for stats computation.")
+    parser.add_argument("--wandb", action="store_true", help="Log metrics to Weights & Biases.")
+    parser.add_argument("--wandb-project", type=str, default="kimodo-fm-g1")
+    parser.add_argument("--wandb-run-name", type=str, default=None)
     return parser.parse_args()
 
 
@@ -170,6 +174,22 @@ def main() -> int:
         weight_decay=train_cfg.weight_decay,
     )
 
+    wandb_logger = WandbLogger(args.wandb)
+    if args.wandb:
+        wandb_logger.init(
+            project=args.wandb_project,
+            run_name=args.wandb_run_name,
+            config={
+                "config": args.config,
+                "no_text": args.no_text,
+                "text_mode": args.text_mode,
+                "device": str(device),
+                "clips": len(dataset),
+                **OmegaConf.to_container(cfg, resolve=True),
+            },
+            output_dir=str(args.output_dir),
+        )
+
     denoiser.train()
     text_tokens = denoiser.root_model.num_text_tokens
     max_steps = int(train_cfg.max_steps)
@@ -225,6 +245,16 @@ def main() -> int:
                 f"elapsed={_format_duration(elapsed)} "
                 f"eta={_format_duration(eta)}"
             )
+            wandb_logger.log_step(
+                step,
+                loss=metrics["loss"].item(),
+                grad_norm=float(grad_norm),
+                t_mean=metrics["t_mean"].item(),
+                ut_norm=metrics["ut_norm"].item(),
+                v_norm=metrics["v_norm"].item(),
+                lr=optimizer.param_groups[0]["lr"],
+                elapsed_sec=elapsed,
+            )
 
         if step % int(train_cfg.save_every) == 0:
             ckpt_dir = save_training_checkpoint(
@@ -236,9 +266,11 @@ def main() -> int:
             )
             denoiser.to(device).train()
             tqdm.write(f"saved checkpoint to {ckpt_dir}")
+            wandb_logger.log_checkpoint(step, str(ckpt_dir))
 
     total_time = time.perf_counter() - start_time
     print(f"Training completed in {_format_duration(total_time)}")
+    wandb_logger.finish()
 
     denoiser.eval()
     with torch.no_grad():
