@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 import torch
@@ -14,6 +15,31 @@ from kimodo.model.flow_matching import FlowMatchingLoss, apply_motion_constraint
 from kimodo.motion_rep import KimodoMotionRep
 from kimodo.train.cfg_dropout import apply_separated_cfg_dropout
 from kimodo.train.constraint_synth import sample_training_constraints
+
+
+def _randomize_batch_heading(
+    motion_rep: KimodoMotionRep,
+    x1: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Rotate canonicalized clips to a random frame-0 heading (official training aug)."""
+    batch_size = x1.shape[0]
+    device = x1.device
+    first_heading_angle = torch.rand(batch_size, device=device) * (2 * math.pi)
+    x1 = motion_rep.unnormalize(x1)
+    rotated: list[Tensor] = []
+    for i in range(batch_size):
+        rotated.append(motion_rep.rotate_to(x1[i : i + 1], first_heading_angle[i : i + 1]))
+    x1 = torch.cat(rotated, dim=0)
+    x1 = motion_rep.normalize(x1)
+    return x1, first_heading_angle
+
+
+def _masked_mse_loss(pred: Tensor, target: Tensor, pad_mask: Tensor) -> Tensor:
+    """MSE averaged over valid (non-padded) frames only."""
+    frame_mask = pad_mask.unsqueeze(-1).expand_as(pred)
+    if not frame_mask.any():
+        return F.mse_loss(pred, target)
+    return F.mse_loss(pred[frame_mask], target[frame_mask])
 
 
 def flow_matching_train_step(
@@ -56,7 +82,7 @@ def flow_matching_train_step(
         observed_motion=observed_motion,
     )
 
-    loss = F.mse_loss(v_pred, ut)
+    loss = _masked_mse_loss(v_pred, ut, pad_mask)
     metrics = {
         "loss": loss.detach(),
         "t_mean": t.mean().detach(),
@@ -82,6 +108,10 @@ def flow_matching_batch_step(
     x1 = batch["feats"].to(device)
     pad_mask = batch["pad_mask"].to(device)
     lengths = batch["lengths"].to(device)
+
+    first_heading_angle: Optional[Tensor] = None
+    if getattr(denoiser.root_model, "input_first_heading_angle", False):
+        x1, first_heading_angle = _randomize_batch_heading(motion_rep, x1)
 
     text_feat, text_pad_mask = text_provider.encode(batch["texts"])
     motion_mask, observed_motion = sample_training_constraints(
@@ -111,6 +141,7 @@ def flow_matching_batch_step(
         flow_loss,
         text_feat=text_feat,
         text_pad_mask=text_pad_mask,
+        first_heading_angle=first_heading_angle,
         motion_mask=motion_mask,
         observed_motion=observed_motion,
     )

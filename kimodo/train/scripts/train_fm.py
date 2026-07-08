@@ -173,6 +173,20 @@ def main() -> int:
         lr=train_cfg.lr,
         weight_decay=train_cfg.weight_decay,
     )
+    warmup_steps = int(train_cfg.get("warmup_steps", 0) or 0)
+    lr_scheduler = None
+    if warmup_steps > 0:
+        lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lr_lambda=lambda step: min(1.0, (step + 1) / warmup_steps),
+        )
+
+    if not args.no_text and args.text_mode == "dummy":
+        print(
+            "WARNING: training with text but --text-mode dummy (zero embeddings). "
+            "Use --text-mode encoder for text-conditioned models.",
+            file=sys.stderr,
+        )
 
     wandb_logger = WandbLogger(args.wandb)
     if args.wandb:
@@ -225,6 +239,8 @@ def main() -> int:
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(denoiser.parameters(), train_cfg.grad_clip)
         optimizer.step()
+        if lr_scheduler is not None:
+            lr_scheduler.step()
 
         elapsed = time.perf_counter() - start_time
         eta = elapsed / step * (max_steps - step)
@@ -267,6 +283,19 @@ def main() -> int:
             denoiser.to(device).train()
             tqdm.write(f"saved checkpoint to {ckpt_dir}")
             wandb_logger.log_checkpoint(step, str(ckpt_dir))
+
+    save_every = int(train_cfg.save_every)
+    if max_steps % save_every != 0:
+        ckpt_dir = save_training_checkpoint(
+            output_dir=args.output_dir / f"step_{max_steps}",
+            denoiser=denoiser.cpu(),
+            denoiser_cfg=denoiser_cfg,
+            training_cfg=OmegaConf.to_container(cfg, resolve=True),
+            stats_dir=stats_workdir,
+        )
+        denoiser.to(device).train()
+        print(f"saved final checkpoint to {ckpt_dir}")
+        wandb_logger.log_checkpoint(max_steps, str(ckpt_dir))
 
     total_time = time.perf_counter() - start_time
     print(f"Training completed in {_format_duration(total_time)}")
