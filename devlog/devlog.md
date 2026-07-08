@@ -109,7 +109,7 @@ nvtop
 
 
 
-# 7.7
+# 7.7 - 7.8
 
 
 
@@ -213,7 +213,13 @@ uv python pin 3.10
 uv venv --python 3.10
 
 source .venv/bin/activate
-uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+# uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+UV_HTTP_TIMEOUT=300 uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+
+# 2. 用独立缓存 + 更长超时
+# export UV_CACHE_DIR=/data_sjy/jf/kimodo/.uv-cache
+# export UV_HTTP_TIMEOUT=300
+# export SKIP_MOTION_CORRECTION_IN_SETUP=1   # 跳过 CMake 编译，加快安装
 
 uv pip install -e ".[all]"
 
@@ -227,10 +233,10 @@ cd datasets/bones-seed
 
 # 使用tmux在后台下载：
 # 新建名为 download 的会话
-tmux new -s download
+tmux new -s download1
 # 在 tmux 里正常执行下载（建议只下 g1，metadata 已有可跳过）
-cd ~/PyProject/kimodo/datasets/bones-seed
-source ~/PyProject/kimodo/.venv/bin/activate
+cd datasets/bones-seed
+source /data_sjy/jf/kimodo/.venv/bin/activate
 hf download bones-studio/seed \
   --repo-type dataset \
   --local-dir . \
@@ -239,9 +245,131 @@ hf download bones-studio/seed \
   --include "LICENSE.md" \
   --include "README.md"
 # 重连 tmux 会话：
-tmux attach -t download
+tmux attach -t download1
+
+## 确认 tar 包存在且体积正确（约 23.5G）
+ls -lh /data_sjy/jf/kimodo/datasets/bones-seed/g1.tar.gz
+# 解压并统计 CSV 数量
+cd /data_sjy/jf/kimodo/datasets/bones-seed
+tar -xzf g1.tar.gz
+find g1/csv -name "*.csv" | wc -l   # 应接近 142220
 
 uv pip install torchcfm
-# 或：uv pip install -e ".[train]"
+uv pip install wandb
+
+wandb login
+
+# 在 kimodo 项目目录下，临时用另一个账号
+cd /data_sjy/jf/kimodo
+export WANDB_API_KEY="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"
+
+# 验证当前用的是哪个账号
+python -c "import wandb; wandb.login(); print(wandb.api.viewer())"
+
+# 下载官方 stats 文件：
+cd /data_sjy/jf/kimodo
+hf download nvidia/Kimodo-G1-SEED-v1 \
+  stats/motion/global_root/mean.npy \
+  stats/motion/global_root/std.npy \
+  stats/motion/local_root/mean.npy \
+  stats/motion/local_root/std.npy \
+  stats/motion/body/mean.npy \
+  stats/motion/body/std.npy \
+  --local-dir checkpoints/Kimodo-G1-SEED-v1
+
+# 下载官方 train split
+hf download nvidia/Kimodo-Motion-Gen-Benchmark \
+  splits/train_split_paths.txt \
+  --repo-type dataset \
+  --local-dir datasets/kimodo-benchmark
+
+
+# 冒烟测试（CPU，小模型，8 步）
+cd /data_sjy/jf/kimodo
+source .venv/bin/activate
+python -m kimodo.train.scripts.train_fm \
+  --smoke \
+  --no-text \
+  --device cpu \
+  --max-files 4
+
+tmux new -s train
+export http_proxy=http://10.127.48.11:3128/
+export https_proxy=http://10.127.48.11:3128/
+export HTTP_PROXY=$http_proxy
+export HTTPS_PROXY=$https_proxy
+export WANDB_API_KEY="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"
+source .venv/bin/activate
+export CUDA_VISIBLE_DEVICES=3
+python -m kimodo.train.scripts.train_fm \
+  --no-text \
+  --data-root datasets/bones-seed \
+  --split-path datasets/kimodo-benchmark/splits/train_split_paths.txt \
+  --stats-path checkpoints/Kimodo-G1-SEED-v1/stats/motion \
+  --output-dir outputs/fm_g1_seed_no_text \
+  --device cuda \
+  --wandb \
+  --wandb-project kimodo-fm-g1 \
+  --wandb-run-name g1-notext-server
 ```
 
+## 代理：
+```bash
+# # 1、开发机使用apt更新失败
+# # 解决方式：输入以下命令指定代理
+# export http_proxy=http://10.127.48.4:3128/
+# export https_proxy=http://10.127.48.4:3128/
+
+# # 2、gpu使用pip和apt的网络代理连接
+# # apt代理使用设置：
+# tee /etc/apt/sources.list << 'EOF'
+# deb http://10.127.48.3:30081/repository/apt/ jammy main restricted universe multiverse
+# deb http://10.127.48.3:30081/repository/apt/ jammy-updates main restricted universe multiverse
+# deb http://10.127.48.3:30081/repository/apt/ jammy-backports main restricted universe multiverse
+# deb http://10.127.48.3:30081/repository/apt/ jammy-security main restricted universe multiverse
+# EOF
+
+# # pip代理使用设置：
+# pip config set global.index-url http://10.127.48.3:30081/repository/pip/simple/
+# pip config set global.trusted-host 10.127.48.3
+
+# 编译：
+cd /data_sjy/jf/kimodo
+source .venv/bin/activate
+export http_proxy=http://10.127.48.11:3128/
+export https_proxy=http://10.127.48.11:3128/
+export HTTP_PROXY=$http_proxy
+export HTTPS_PROXY=$https_proxy
+git config --global http.proxy http://10.127.48.11:3128/
+git config --global https.proxy http://10.127.48.11:3128/
+export UV_DEFAULT_INDEX=http://10.127.48.3:30081/repository/pip/simple/
+export UV_HTTP_TIMEOUT=300
+uv pip install -v -e ".[all]"
+
+# 不编译：
+export http_proxy=http://10.127.48.11:3128/
+export https_proxy=http://10.127.48.11:3128/
+export HTTP_PROXY=$http_proxy
+export HTTPS_PROXY=$https_proxy
+export UV_DEFAULT_INDEX=http://10.127.48.3:30081/repository/pip/simple/
+export UV_HTTP_TIMEOUT=300
+export SKIP_MOTION_CORRECTION_IN_SETUP=1
+uv pip install -e ".[all]"
+
+# 下载数据集：
+mkdir -p datasets/bones-seed
+cd datasets/bones-seed
+export http_proxy=http://10.127.48.11:3128/
+export https_proxy=http://10.127.48.11:3128/
+export HTTP_PROXY=$http_proxy
+export HTTPS_PROXY=$https_proxy
+cd /data_sjy/jf/kimodo/datasets/bones-seed
+source /data_sjy/jf/kimodo/.venv/bin/activate
+hf download bones-studio/seed \
+  --repo-type dataset \
+  --local-dir . \
+  --include "g1.tar.gz" \
+  --include "metadata/*" \
+  --include "LICENSE.md" \
+  --include "README.md"
+```
