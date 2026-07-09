@@ -311,6 +311,64 @@ python -m kimodo.train.scripts.train_fm \
   --wandb \
   --wandb-project kimodo-fm-g1 \
   --wandb-run-name g1-notext-server
+
+tmux attach -t train
+```
+
+## 使用本地配置进行训练：
+```bash
+tmux attach -t train
+cd /home/zhengjk/PyProject/kimodo
+source .venv/bin/activate
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+python -m kimodo.train.scripts.train_fm \
+  --no-text \
+  --local \
+  --data-root datasets/bones-seed \
+  --split-path datasets/kimodo-benchmark/splits/train_split_paths.txt \
+  --stats-path checkpoints/Kimodo-G1-SEED-v1/stats/motion \
+  --output-dir outputs/fm_g1_seed_no_text_local \
+  --device cuda \
+  --wandb \
+  --wandb-project kimodo-fm-g1 \
+  --wandb-run-name g1-notext-server-local
+
+# 续训练
+python -m kimodo.train.scripts.train_fm \
+  --no-text \
+  --local \
+  --resume-from outputs/fm_g1_seed_no_text_local/step_50000 \
+  --data-root datasets/bones-seed \
+  --split-path datasets/kimodo-benchmark/splits/train_split_paths.txt \
+  --stats-path checkpoints/Kimodo-G1-SEED-v1/stats/motion \
+  --output-dir outputs/fm_g1_seed_no_text_local \
+  --device cuda \
+  --wandb \
+  --wandb-project kimodo-fm-g1 \
+  --wandb-run-name g1-notext-server-local-resume-2
+```
+
+## 本地测试：
+```bash
+cd /home/zhengjk/PyProject/kimodo
+conda deactivate
+source .venv/bin/activate
+export TEXT_ENCODER_DEVICE=cpu
+kimodo_demo \
+  --model g1-seed \
+  --checkpoint outputs/fm_g1_seed_no_text_local/step_50000 \
+  --examples-dir kimodo/assets/demo/examples/kimodo-g1-rp
+# 浏览器打开：http://127.0.0.1:7860
+# 在 UI 中：
+# Settings → 确认是 SEED + G1 → 点 Load model
+# Load/Save → Example → 选 03_full_body_keyframes 等 → Load Example
+# Generate → 关闭 CFG，Denoising Steps = 20 → Generate
+官方默认加载（不变）
+kimodo_demo                          # 默认 SOMA-RP，从 HF 下载
+kimodo_demo --model g1-seed          # 官方 Kimodo-G1-SEED-v1
+export CHECKPOINT_DIR=./checkpoints  # 仍可用环境变量覆盖
+kimodo_demo --model g1-seed
 ```
 
 ## 代理：

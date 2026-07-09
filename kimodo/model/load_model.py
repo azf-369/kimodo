@@ -105,6 +105,23 @@ def _select_text_encoder_conf(text_encoder_url: str, text_encoder_fp32: bool = F
         return _build_local_text_encoder_conf(text_encoder_fp32)
 
 
+def _normalize_checkpoint_config_paths(model_conf, model_path: Path) -> dict:
+    """Point denoiser weights/stats at files under ``model_path`` when present."""
+    cfg = OmegaConf.to_container(model_conf, resolve=True)
+    denoiser = cfg.get("denoiser")
+    if denoiser is None:
+        return cfg
+
+    weights = model_path / "model.safetensors"
+    stats = model_path / "stats" / "motion"
+    if weights.is_file():
+        denoiser["ckpt_path"] = str(weights)
+    if stats.is_dir():
+        motion_rep = denoiser.setdefault("motion_rep", {})
+        motion_rep["stats_path"] = str(stats)
+    return cfg
+
+
 def load_model(
     modelname=None,
     device=None,
@@ -113,6 +130,7 @@ def load_model(
     return_resolved_name: bool = False,
     text_encoder=None,
     text_encoder_fp32: bool = False,
+    checkpoint_path: Optional[str | Path] = None,
 ):
     """Load a kimodo model by name (e.g. 'g1', 'soma').
 
@@ -134,6 +152,8 @@ def load_model(
         text_encoder: Pre-built text encoder to reuse. When provided, skips
             text encoder selection/instantiation entirely.
         text_encoder_fp32: If True, uses fp32 for the text encoder rather than default bfloat16.
+        checkpoint_path: Optional local checkpoint directory containing ``config.yaml``.
+            When set, skips Hugging Face / CHECKPOINT_DIR resolution for this load.
 
     Returns:
         Loaded model in eval mode, or (model, resolved short key) if
@@ -156,9 +176,11 @@ def load_model(
 
     resolved_modelname = modelname
 
+    if checkpoint_path is not None:
+        model_path = Path(checkpoint_path).expanduser().resolve()
+        print(f"Loading checkpoint from {model_path}")
     # In case, we specify a custom checkpoint directory
-    configured_checkpoint_dir = get_env_var("CHECKPOINT_DIR")
-    if configured_checkpoint_dir:
+    elif configured_checkpoint_dir := get_env_var("CHECKPOINT_DIR"):
         print(f"CHECKPOINT_DIR is set to {configured_checkpoint_dir}, checking the local cache...")
         # Checkpoint folders are named by display name (e.g. Kimodo-SOMA-RP-v1)
         info = get_model_info(modelname)
@@ -179,6 +201,8 @@ def load_model(
         raise FileNotFoundError(f"The model checkpoint folder exists but config.yaml is missing: {model_config_path}")
 
     model_conf = OmegaConf.load(model_config_path)
+    if checkpoint_path is not None:
+        model_conf = OmegaConf.create(_normalize_checkpoint_config_paths(model_conf, model_path))
 
     if modelname in TMR_MODELS:
         # Same process at the moment for TMR and Kimodo

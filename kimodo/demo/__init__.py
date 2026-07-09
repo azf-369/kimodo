@@ -18,10 +18,27 @@ def main() -> None:
         default=DEFAULT_MODEL,
         help="Default model to load (e.g. Kimodo-SOMA-RP-v1, kimodo-soma-rp, or SOMA).",
     )
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Local checkpoint directory (config.yaml + model.safetensors). "
+        "Applies to --model only; other models still use HF / CHECKPOINT_DIR.",
+    )
+    parser.add_argument(
+        "--examples-dir",
+        type=str,
+        default=None,
+        help="Directory of demo example subfolders for --model (e.g. kimodo-g1-rp examples).",
+    )
     args = parser.parse_args()
 
     resolved = resolve_model_name(args.model, "Kimodo")
-    demo = Demo(default_model_name=resolved)
+    demo = Demo(
+        default_model_name=resolved,
+        checkpoint_path=args.checkpoint,
+        examples_dir=args.examples_dir,
+    )
     demo.run()
 
 

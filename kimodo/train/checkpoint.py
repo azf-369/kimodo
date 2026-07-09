@@ -34,17 +34,25 @@ def save_training_checkpoint(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    model_path = output_dir / "model.safetensors"
+    save_file(denoiser.state_dict(), model_path)
+
     stats_dest = output_dir / "stats" / "motion"
     stats_dest.mkdir(parents=True, exist_ok=True)
+    stats_root = Path(stats_dir)
     for sub in ("global_root", "local_root", "body"):
-        src = Path(stats_dir) / sub
+        src = stats_root / sub
         dst = stats_dest / sub
         dst.mkdir(parents=True, exist_ok=True)
         for name in ("mean.npy", "std.npy"):
-            shutil.copy2(src / name, dst / name)
-
-    model_path = output_dir / "model.safetensors"
-    save_file(denoiser.state_dict(), model_path)
+            src_file = src / name
+            if not src_file.is_file():
+                raise FileNotFoundError(
+                    f"Missing stats file: {src_file}. "
+                    "Ensure checkpoints/Kimodo-G1-SEED-v1/stats/motion exists "
+                    "or pass --stats-path to a valid stats directory."
+                )
+            shutil.copy2(src_file, dst / name)
 
     export_cfg = {
         "_target_": "kimodo.model.Kimodo",

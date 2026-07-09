@@ -53,7 +53,12 @@ from .state import ClientSession, ModelBundle
 
 
 class Demo:
-    def __init__(self, default_model_name: str = DEFAULT_MODEL):
+    def __init__(
+        self,
+        default_model_name: str = DEFAULT_MODEL,
+        checkpoint_path: Optional[str] = None,
+        examples_dir: Optional[str] = None,
+    ):
         self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
         print(f"Using device: {self.device}")
         self.models: dict[str, ModelBundle] = {}
@@ -62,6 +67,10 @@ class Demo:
         if resolved not in MODEL_NAMES:
             raise ValueError(f"Unknown model '{default_model_name}'. Expected one of: {MODEL_NAMES}")
         self.default_model_name = resolved
+        self.custom_checkpoint_path = (
+            os.path.abspath(os.path.expanduser(checkpoint_path)) if checkpoint_path else None
+        )
+        self.custom_examples_dir = os.path.abspath(os.path.expanduser(examples_dir)) if examples_dir else None
         self.ensure_examples_layout()
         self.load_model(self.default_model_name)
 
@@ -122,6 +131,8 @@ class Demo:
                 shutil.move(src, dst)
 
     def get_examples_base_dir(self, model_name: str, absolute: bool = True) -> str:
+        if self.custom_examples_dir is not None and model_name == self.default_model_name:
+            return self.custom_examples_dir
         return MODEL_EXAMPLES_DIRS[model_name]
 
     def load_model(self, model_name: str) -> ModelBundle:
@@ -129,11 +140,15 @@ class Demo:
             return self.models[model_name]
 
         print(f"Loading model {model_name}...")
+        checkpoint_path = None
+        if self.custom_checkpoint_path is not None and model_name == self.default_model_name:
+            checkpoint_path = self.custom_checkpoint_path
         try:
             model = load_model(
                 modelname=model_name,
                 device=self.device,
                 text_encoder=self._text_encoder,
+                checkpoint_path=checkpoint_path,
             )
         except Exception as e:
             print(f"Error loading model: {e}\nMake sure text encoder server is running!")

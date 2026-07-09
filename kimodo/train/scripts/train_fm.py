@@ -42,6 +42,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train Kimodo G1 with Flow Matching.")
     parser.add_argument("--config", type=str, default="fm_g1_seed", help="Config name under kimodo/train/config/")
     parser.add_argument("--smoke", action="store_true", help="Use smoke overrides (small model, few steps).")
+    parser.add_argument(
+        "--local",
+        action="store_true",
+        help="Merge fm_g1_seed_local.yaml (batch_size=2, num_workers=0; full model size).",
+    )
+    parser.add_argument("--batch-size", type=int, default=None, help="Override training.batch_size.")
+    parser.add_argument("--max-frames", type=int, default=None, help="Override training.max_frames.")
+    parser.add_argument("--max-steps", type=int, default=None, help="Override training.max_steps.")
     parser.add_argument("--data-root", type=Path, default=Path("datasets/bones-seed"))
     parser.add_argument("--metadata", type=Path, default=None)
     parser.add_argument("--split-path", type=Path, default=None)
@@ -66,7 +74,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb", action="store_true", help="Log metrics to Weights & Biases.")
     parser.add_argument("--wandb-project", type=str, default="kimodo-fm-g1")
     parser.add_argument("--wandb-run-name", type=str, default=None)
+    parser.add_argument(
+        "--resume-from",
+        type=Path,
+        default=None,
+        help="Resume model weights from a prior training checkpoint dir (e.g. outputs/.../step_10000).",
+    )
     return parser.parse_args()
+
+
+def _parse_resume_step(resume_dir: Path) -> int:
+    name = resume_dir.name
+    if not name.startswith("step_"):
+        raise ValueError(f"--resume-from must be a step_N directory, got: {resume_dir}")
+    return int(name.split("_", 1)[1])
 
 
 def main() -> int:
@@ -79,6 +100,15 @@ def main() -> int:
         cfg = OmegaConf.merge(cfg, smoke_cfg)
         if args.max_files is None:
             args.max_files = 4
+    if args.local:
+        local_cfg = load_train_config("fm_g1_seed_local")
+        cfg = OmegaConf.merge(cfg, local_cfg)
+    if args.batch_size is not None:
+        cfg.training.batch_size = args.batch_size
+    if args.max_frames is not None:
+        cfg.training.max_frames = args.max_frames
+    if args.max_steps is not None:
+        cfg.training.max_steps = args.max_steps
     if args.no_text:
         if args.text_mode == "encoder":
             print("WARNING: --no-text forces --text-mode dummy (LLM2Vec is not used).", file=sys.stderr)
@@ -124,6 +154,19 @@ def main() -> int:
 
     denoiser = build_denoiser(cfg, stats_path=str(stats_path), device=device)
     motion_rep = denoiser.motion_rep
+
+    start_step = 1
+    if args.resume_from is not None:
+        resume_dir = args.resume_from.resolve()
+        weights_path = resume_dir / "model.safetensors"
+        if not weights_path.is_file():
+            print(f"ERROR: resume checkpoint missing model.safetensors: {weights_path}", file=sys.stderr)
+            return 1
+        from safetensors.torch import load_file
+
+        denoiser.load_state_dict(load_file(str(weights_path)))
+        start_step = _parse_resume_step(resume_dir) + 1
+        print(f"Resumed weights from {resume_dir}; continuing at step {start_step}")
 
     # Dataset preprocessing must stay on CPU: DataLoader workers cannot safely use
     # CUDA tensors after fork (denoiser.motion_rep lives on GPU when --device cuda).
@@ -210,13 +253,17 @@ def main() -> int:
     log_every = int(train_cfg.log_every)
     print(
         f"Device: {device} | clips: {len(dataset)} | feat_dim: {motion_rep.motion_rep_dim} "
-        f"| max_steps: {max_steps} | text_mode: {args.text_mode} "
+        f"| max_steps: {max_steps} | start_step: {start_step} | text_mode: {args.text_mode} "
         f"| no_text: {args.no_text} | text_tokens: {text_tokens} "
-        f"| num_workers: {train_cfg.num_workers}"
+        f"| num_workers: {train_cfg.num_workers} | stats_dir: {stats_workdir}"
     )
 
+    if lr_scheduler is not None and start_step > 1:
+        for _ in range(start_step - 1):
+            lr_scheduler.step()
+
     start_time = time.perf_counter()
-    progress = tqdm(range(1, max_steps + 1), desc="Training", unit="step", dynamic_ncols=True)
+    progress = tqdm(range(start_step, max_steps + 1), desc="Training", unit="step", dynamic_ncols=True)
 
     for step in progress:
         batch = next(data_iter)
@@ -243,7 +290,8 @@ def main() -> int:
             lr_scheduler.step()
 
         elapsed = time.perf_counter() - start_time
-        eta = elapsed / step * (max_steps - step)
+        steps_done = step - start_step + 1
+        eta = elapsed / max(steps_done, 1) * (max_steps - step)
 
         if step % log_every == 0 or step == 1:
             progress.set_postfix(
