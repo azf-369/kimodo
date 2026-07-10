@@ -18,10 +18,17 @@ training:
   lr: 1.0e-4
   weight_decay: 0.0
   warmup_steps: 1000
-  max_steps: 200000
+  # Official Kimodo DDPM training: 500k (text-only) + 500k (text+constraints) = 1M steps.
+  # FM trainer uses a single-phase loop today; total step budget matches official.
+  phase_1_steps: 500000
+  phase_2_steps: 500000
+  max_steps: 1000000
   grad_clip: 1.0
   log_every: 50
-  save_every: 5000
+  save_every: 25000
+  # Optional: if set, overrides save_every (in optimizer steps).
+  # Example: save_every_epochs: 20  -> every ~20 full passes over the train split.
+  save_every_epochs: null
   constraint_prob: 0.8
   max_keyframes: 4
   cfg_dropout:

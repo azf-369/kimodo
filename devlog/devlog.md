@@ -12,6 +12,9 @@ git config user.name "azf-369"
 
 # 配置全局邮箱
 git config user.email "azf-157@sjtu.edu.cn"
+
+# 关闭密码拦截
+unset GIT_ASKPASS
 ```
 
 ## 环境安装：
@@ -365,7 +368,7 @@ python -m kimodo.train.scripts.train_fm \
 
 ### kimodo_train_1
 ```bash
-使用预缓存文本来提高训练速度：
+# 使用预缓存文本来提高训练速度：
 python -m kimodo.train.scripts.precompute_text_embeddings \
   --server \
   --data-root datasets/bones-seed \
@@ -425,6 +428,44 @@ python -m kimodo.train.scripts.train_fm \
   --wandb \
   --wandb-project kimodo-fm-g1 \
   --wandb-run-name g1-notext-server-local-resume-2
+```
+
+## 4GPU服务器训练：
+```bash
+# 1. 预计算文本 embedding（只需一次）
+python -m kimodo.train.scripts.precompute_text_embeddings \
+  --server \
+  --data-root datasets/bones-seed \
+  --split-path datasets/kimodo-benchmark/splits/train_split_paths.txt
+
+# 2. 4 卡训练（global batch=512，无 grad_accum；约每 25000 step / 100 epoch 存一次 ckpt）
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+torchrun --standalone --nproc_per_node=4 \
+  -m kimodo.train.scripts.train_fm \
+  --server --server-4gpu \
+  --text-mode encoder \
+  --data-root datasets/bones-seed \
+  --split-path datasets/kimodo-benchmark/splits/train_split_paths.txt \
+  --stats-path checkpoints/Kimodo-G1-SEED-v1/stats/motion \
+  --output-dir outputs/fm_g1_seed_4gpu_1m \
+  --device cuda \
+  --wandb --wandb-run-name g1-text-4gpu-1m
+
+# 或用启动脚本：
+bash kimodo/train/scripts/launch_train_fm_4gpu.sh \
+  --wandb --wandb-run-name g1-text-4gpu-seed
+
+# 无文本、4 卡
+torchrun --standalone --nproc_per_node=4 \
+  -m kimodo.train.scripts.train_fm \
+  --server --server-4gpu \
+  --no-text \
+  --data-root datasets/bones-seed \
+  --split-path datasets/kimodo-benchmark/splits/train_split_paths.txt \
+  --stats-path checkpoints/Kimodo-G1-SEED-v1/stats/motion \
+  --output-dir outputs/fm_g1_seed_no_text_4gpu \
+  --device cuda \
+  --wandb
 ```
 
 ## 本地测试：

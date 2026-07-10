@@ -8,10 +8,12 @@
 training:
   max_frames: 300
   batch_size: 48
+  gradient_accumulation_steps: 1
   num_workers: 12
   # ~linear LR scale from official batch_size=4 / lr=1e-4 (48/4 = 12x, use 8e-4 for stability).
   lr: 8.0e-4
   warmup_steps: 2000
+  max_steps: 1000000
   grad_clip: 1.0
 
 dataloader:

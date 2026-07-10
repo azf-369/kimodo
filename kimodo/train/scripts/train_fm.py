@@ -6,14 +6,15 @@
 from __future__ import annotations
 
 import argparse
-import itertools
 import sys
 import time
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 
 from kimodo.model.flow_matching import FlowMatchingLoss
@@ -21,6 +22,15 @@ from kimodo.train.build import build_denoiser, build_motion_rep
 from kimodo.train.checkpoint import save_training_checkpoint
 from kimodo.train.collate import collate_motion_batch
 from kimodo.train.dataset import G1SeedTrainingDataset
+from kimodo.train.distributed import (
+    barrier,
+    global_batch_size,
+    init_distributed,
+    is_main_process,
+    print_rank0,
+    unwrap_module,
+    wrap_distributed,
+)
 from kimodo.train.flow_train import flow_matching_batch_step
 from kimodo.train.stats_compute import compute_motion_stats, save_motion_stats
 from kimodo.train.text_cache import (
@@ -29,6 +39,12 @@ from kimodo.train.text_cache import (
     resolve_text_cache_dir,
 )
 from kimodo.train.text_embedding import TextEmbeddingProvider
+from kimodo.train.training_progress import (
+    EpochSchedule,
+    StepEpochProgress,
+    format_epoch_progress,
+    resolve_save_every_steps,
+)
 from kimodo.train.utils import apply_no_text_overrides, load_train_config
 from kimodo.train.wandb_log import WandbLogger
 
@@ -57,7 +73,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Merge fm_g1_seed_server.yaml (H100 80GB: batch_size=48, num_workers=12).",
     )
-    parser.add_argument("--batch-size", type=int, default=None, help="Override training.batch_size.")
+    parser.add_argument(
+        "--server-4gpu",
+        action="store_true",
+        help="Merge fm_g1_seed_server_4gpu.yaml for 4x H100 DDP (launch with torchrun).",
+    )
+    parser.add_argument("--batch-size", type=int, default=None, help="Override training.batch_size (per GPU).")
+    parser.add_argument(
+        "--grad-accum-steps",
+        type=int,
+        default=None,
+        help="Override training.gradient_accumulation_steps.",
+    )
     parser.add_argument("--num-workers", type=int, default=None, help="Override training.num_workers.")
     parser.add_argument("--max-frames", type=int, default=None, help="Override training.max_frames.")
     parser.add_argument("--max-steps", type=int, default=None, help="Override training.max_steps.")
@@ -112,9 +139,25 @@ def _parse_resume_step(resume_dir: Path) -> int:
     return int(name.split("_", 1)[1])
 
 
+def _next_batch(data_iter, loader, sampler, epoch: int):
+    """Fetch next batch, restarting the loader and advancing sampler epoch when exhausted."""
+    try:
+        return next(data_iter), data_iter, epoch
+    except StopIteration:
+        epoch += 1
+        if sampler is not None:
+            sampler.set_epoch(epoch)
+        data_iter = iter(loader)
+        return next(data_iter), data_iter, epoch
+
+
 def main() -> int:
     args = parse_args()
-    device = torch.device(args.device)
+    distributed, rank, world_size, local_rank = init_distributed()
+    if distributed:
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device(args.device)
 
     cfg = load_train_config(args.config)
     if args.smoke:
@@ -125,11 +168,14 @@ def main() -> int:
     if args.local:
         local_cfg = load_train_config("fm_g1_seed_local")
         cfg = OmegaConf.merge(cfg, local_cfg)
-    if args.server:
-        server_cfg = load_train_config("fm_g1_seed_server")
-        cfg = OmegaConf.merge(cfg, server_cfg)
+    if args.server or args.server_4gpu:
+        cfg = OmegaConf.merge(cfg, load_train_config("fm_g1_seed_server"))
+    if args.server_4gpu:
+        cfg = OmegaConf.merge(cfg, load_train_config("fm_g1_seed_server_4gpu"))
     if args.batch_size is not None:
         cfg.training.batch_size = args.batch_size
+    if args.grad_accum_steps is not None:
+        cfg.training.gradient_accumulation_steps = args.grad_accum_steps
     if args.num_workers is not None:
         cfg.training.num_workers = args.num_workers
     if args.max_frames is not None:
@@ -138,20 +184,32 @@ def main() -> int:
         cfg.training.max_steps = args.max_steps
     if args.no_text:
         if args.text_mode == "encoder":
-            print("WARNING: --no-text forces --text-mode dummy (LLM2Vec is not used).", file=sys.stderr)
+            print_rank0(rank, "WARNING: --no-text forces --text-mode dummy (LLM2Vec is not used).")
         args.text_mode = "dummy"
         cfg = apply_no_text_overrides(cfg)
-    if args.server and args.text_mode == "encoder" and not args.no_text:
-        text_server_cfg = load_train_config("fm_g1_seed_server_text")
-        cfg = OmegaConf.merge(cfg, text_server_cfg)
+    use_text_training = args.text_mode == "encoder" and not args.no_text
+    if (args.server or args.server_4gpu) and use_text_training:
+        cfg = OmegaConf.merge(cfg, load_train_config("fm_g1_seed_server_text"))
+    if args.server_4gpu and use_text_training:
+        cfg = OmegaConf.merge(cfg, load_train_config("fm_g1_seed_server_4gpu_text"))
     train_cfg = cfg.training
+    grad_accum_steps = max(1, int(train_cfg.get("gradient_accumulation_steps", 1) or 1))
+    per_gpu_batch = int(train_cfg.batch_size)
+    effective_global_batch = global_batch_size(per_gpu_batch, world_size, grad_accum_steps)
     text_cache_dir = resolve_text_cache_dir(cfg, args.text_cache_dir)
     use_text_cache = text_cache_dir is not None and not args.no_text and args.text_mode == "encoder"
     text_cache_cfg = OmegaConf.to_container(cfg.get("text_cache", {}), resolve=True) if "text_cache" in cfg else {}
     auto_precompute = bool(text_cache_cfg.get("auto_precompute", False)) or args.precompute_text_cache
 
+    if args.server_4gpu and not distributed:
+        print_rank0(
+            rank,
+            "WARNING: --server-4gpu without torchrun runs single-GPU; "
+            "use: torchrun --standalone --nproc_per_node=4 -m kimodo.train.scripts.train_fm ...",
+        )
+
     if not args.data_root.is_dir():
-        print(f"ERROR: data root not found: {args.data_root}", file=sys.stderr)
+        print_rank0(rank, f"ERROR: data root not found: {args.data_root}")
         return 1
 
     default_stats = Path("checkpoints/Kimodo-G1-SEED-v1/stats/motion")
@@ -160,7 +218,7 @@ def main() -> int:
         stats_path = default_stats
 
     stats_workdir = args.output_dir / "stats_work"
-    if args.compute_stats or stats_path is None:
+    if is_main_process(rank) and (args.compute_stats or stats_path is None):
         stats_motion_rep = build_denoiser(cfg, stats_path=None, device=torch.device("cpu")).motion_rep
         stats_dataset = G1SeedTrainingDataset(
             args.data_root,
@@ -177,14 +235,19 @@ def main() -> int:
         compute_motion_stats(
             stats_dataset,
             stats_motion_rep,
-            batch_size=train_cfg.batch_size,
+            batch_size=per_gpu_batch,
             num_workers=train_cfg.num_workers,
             max_batches=args.stats_batches if args.smoke else None,
         )
         stats_path = save_motion_stats(stats_motion_rep, stats_workdir)
-        print(f"Computed stats at {stats_path}")
+        print_rank0(rank, f"Computed stats at {stats_path}")
     elif stats_path is not None:
         stats_workdir = Path(stats_path)
+    else:
+        stats_workdir = args.output_dir / "stats_work"
+    barrier()
+    if stats_path is None:
+        stats_path = stats_workdir
 
     denoiser = build_denoiser(cfg, stats_path=str(stats_path), device=device)
     motion_rep = denoiser.motion_rep
@@ -194,13 +257,16 @@ def main() -> int:
         resume_dir = args.resume_from.resolve()
         weights_path = resume_dir / "model.safetensors"
         if not weights_path.is_file():
-            print(f"ERROR: resume checkpoint missing model.safetensors: {weights_path}", file=sys.stderr)
+            print_rank0(rank, f"ERROR: resume checkpoint missing model.safetensors: {weights_path}")
             return 1
         from safetensors.torch import load_file
 
         denoiser.load_state_dict(load_file(str(weights_path)))
         start_step = _parse_resume_step(resume_dir) + 1
-        print(f"Resumed weights from {resume_dir}; continuing at step {start_step}")
+        print_rank0(rank, f"Resumed weights from {resume_dir}; continuing at step {start_step}")
+
+    if distributed:
+        denoiser = wrap_distributed(denoiser, device=device, local_rank=local_rank)
 
     # Dataset preprocessing must stay on CPU: DataLoader workers cannot safely use
     # CUDA tensors after fork (denoiser.motion_rep lives on GPU when --device cuda).
@@ -235,40 +301,69 @@ def main() -> int:
         missing = count_missing_embeddings(dataset.samples, text_cache_dir)
         if missing > 0:
             if not auto_precompute:
-                print(
+                print_rank0(
+                    rank,
                     f"ERROR: {missing} text embeddings missing under {text_cache_dir}. "
                     "Run with --precompute-text-cache or set text_cache.auto_precompute: true.",
-                    file=sys.stderr,
                 )
                 return 1
-            print(f"Precomputing {missing} missing text embeddings into {text_cache_dir} ...")
-            precompute_text_embeddings(
-                dataset.samples,
-                cache_dir=text_cache_dir,
-                encoder_cfg=encoder_cfg,
-                num_tokens=num_tokens,
-                llm_dim=llm_dim,
-                device=device,
-            )
-        print(f"Using precomputed text embeddings from {text_cache_dir}")
+            if is_main_process(rank):
+                precompute_device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+                print_rank0(rank, f"Precomputing {missing} missing text embeddings into {text_cache_dir} ...")
+                precompute_text_embeddings(
+                    dataset.samples,
+                    cache_dir=text_cache_dir,
+                    encoder_cfg=encoder_cfg,
+                    num_tokens=num_tokens,
+                    llm_dim=llm_dim,
+                    device=precompute_device,
+                )
+        barrier()
+        print_rank0(rank, f"Using precomputed text embeddings from {text_cache_dir}")
 
     num_workers = int(train_cfg.num_workers)
     dl_cfg = OmegaConf.to_container(cfg.get("dataloader", {}), resolve=True) if "dataloader" in cfg else {}
     pin_memory = bool(dl_cfg.get("pin_memory", device.type == "cuda"))
+    per_gpu_batch = min(per_gpu_batch, len(dataset))
+    sampler = None
+    if distributed:
+        sampler = DistributedSampler(dataset, shuffle=True, drop_last=len(dataset) >= per_gpu_batch)
     loader_kwargs: dict = {
-        "batch_size": min(train_cfg.batch_size, len(dataset)),
-        "shuffle": True,
+        "batch_size": per_gpu_batch,
         "num_workers": num_workers,
         "collate_fn": collate_motion_batch,
-        "drop_last": len(dataset) >= train_cfg.batch_size,
+        "drop_last": len(dataset) >= per_gpu_batch,
     }
+    if sampler is not None:
+        loader_kwargs["sampler"] = sampler
+        loader_kwargs["shuffle"] = False
+    else:
+        loader_kwargs["shuffle"] = True
     if pin_memory:
         loader_kwargs["pin_memory"] = True
     if num_workers > 0:
         loader_kwargs["persistent_workers"] = bool(dl_cfg.get("persistent_workers", True))
         loader_kwargs["prefetch_factor"] = int(dl_cfg.get("prefetch_factor", 2))
     loader = DataLoader(dataset, **loader_kwargs)
-    data_iter = itertools.cycle(loader)
+    drop_last = bool(loader_kwargs["drop_last"])
+    epoch_schedule = EpochSchedule.from_training(
+        num_samples=len(dataset),
+        global_batch_size=effective_global_batch,
+        max_steps=int(train_cfg.max_steps),
+        micro_batches_per_epoch=len(loader),
+        grad_accum_steps=grad_accum_steps,
+        drop_last=drop_last,
+    )
+    save_every_epochs_cfg = train_cfg.get("save_every_epochs")
+    save_every = resolve_save_every_steps(
+        save_every_steps=int(train_cfg.save_every) if train_cfg.get("save_every") is not None else None,
+        save_every_epochs=float(save_every_epochs_cfg) if save_every_epochs_cfg is not None else None,
+        steps_per_epoch=epoch_schedule.steps_per_epoch,
+    )
+    data_epoch = 0
+    if sampler is not None:
+        sampler.set_epoch(data_epoch)
+    data_iter = iter(loader)
 
     text_provider_mode = "dummy" if use_text_cache else args.text_mode
     text_provider = TextEmbeddingProvider(
@@ -295,14 +390,14 @@ def main() -> int:
         )
 
     if not args.no_text and args.text_mode == "dummy":
-        print(
+        print_rank0(
+            rank,
             "WARNING: training with text but --text-mode dummy (zero embeddings). "
             "Use --text-mode encoder for text-conditioned models.",
-            file=sys.stderr,
         )
 
-    wandb_logger = WandbLogger(args.wandb)
-    if args.wandb:
+    wandb_logger = WandbLogger(args.wandb and is_main_process(rank))
+    if args.wandb and is_main_process(rank):
         wandb_logger.init(
             project=args.wandb_project,
             run_name=args.wandb_run_name,
@@ -311,23 +406,36 @@ def main() -> int:
                 "no_text": args.no_text,
                 "text_mode": args.text_mode,
                 "device": str(device),
+                "distributed": distributed,
+                "world_size": world_size,
+                "per_gpu_batch": per_gpu_batch,
+                "grad_accum_steps": grad_accum_steps,
+                "global_batch_size": effective_global_batch,
                 "clips": len(dataset),
+                "steps_per_epoch": epoch_schedule.steps_per_epoch,
+                "samples_per_epoch": epoch_schedule.samples_per_epoch,
+                "total_epochs": epoch_schedule.total_epochs,
+                "save_every_steps": save_every,
                 **OmegaConf.to_container(cfg, resolve=True),
             },
             output_dir=str(args.output_dir),
         )
 
     denoiser.train()
-    text_tokens = denoiser.root_model.num_text_tokens
+    text_tokens = unwrap_module(denoiser).root_model.num_text_tokens
     max_steps = int(train_cfg.max_steps)
     log_every = int(train_cfg.log_every)
-    print(
-        f"Device: {device} | clips: {len(dataset)} | feat_dim: {motion_rep.motion_rep_dim} "
-        f"| max_steps: {max_steps} | start_step: {start_step} | text_mode: {args.text_mode} "
-        f"| text_cache: {text_cache_dir if use_text_cache else 'off'} "
+    print_rank0(
+        rank,
+        f"Device: {device} | rank: {rank}/{world_size} | clips: {len(dataset)} "
+        f"| feat_dim: {motion_rep.motion_rep_dim} | max_steps: {max_steps} | start_step: {start_step} "
+        f"| text_mode: {args.text_mode} | text_cache: {text_cache_dir if use_text_cache else 'off'} "
         f"| no_text: {args.no_text} | text_tokens: {text_tokens} "
-        f"| batch_size: {train_cfg.batch_size} | lr: {train_cfg.lr} "
-        f"| num_workers: {train_cfg.num_workers} | stats_dir: {stats_workdir}"
+        f"| per_gpu_batch: {per_gpu_batch} | grad_accum: {grad_accum_steps} "
+        f"| global_batch: {effective_global_batch} | lr: {train_cfg.lr} "
+        f"| steps/epoch: {epoch_schedule.steps_per_epoch} "
+        f"| epochs≈{epoch_schedule.total_epochs:.1f} | save_every: {save_every} steps "
+        f"| num_workers: {num_workers} | stats_dir: {stats_workdir}",
     )
 
     if lr_scheduler is not None and start_step > 1:
@@ -335,130 +443,186 @@ def main() -> int:
             lr_scheduler.step()
 
     start_time = time.perf_counter()
-    progress = tqdm(range(start_step, max_steps + 1), desc="Training", unit="step", dynamic_ncols=True)
-
-    for step in progress:
-        batch = next(data_iter)
-        optimizer.zero_grad(set_to_none=True)
-        loss, metrics = flow_matching_batch_step(
-            denoiser,
-            motion_rep,
-            batch,
-            flow_loss,
-            text_provider,
-            cfg_dropout=OmegaConf.to_container(train_cfg.cfg_dropout, resolve=True),
-            constraint_prob=train_cfg.constraint_prob,
-            max_keyframes=train_cfg.max_keyframes,
+    progress = None
+    if is_main_process(rank):
+        progress = tqdm(
+            total=max_steps - start_step + 1,
+            desc="Training",
+            unit="step",
+            dynamic_ncols=True,
         )
 
-        if not torch.isfinite(loss):
-            tqdm.write(f"ERROR: non-finite loss at step {step}: {loss.item()}")
-            return 1
+    step_range = range(start_step, max_steps + 1)
+    optimizer.zero_grad(set_to_none=True)
+    for step in step_range:
+        step_loss = 0.0
+        step_metrics = None
+        epoch_progress = StepEpochProgress.at_step(step, epoch_schedule)
+        for _micro in range(grad_accum_steps):
+            prev_data_epoch = data_epoch
+            batch, data_iter, data_epoch = _next_batch(data_iter, loader, sampler, data_epoch)
+            if data_epoch > prev_data_epoch:
+                print_rank0(
+                    rank,
+                    f"--- dataloader epoch {data_epoch} started "
+                    f"(optimizer {format_epoch_progress(epoch_progress)}) ---",
+                )
+            loss, metrics = flow_matching_batch_step(
+                denoiser,
+                motion_rep,
+                batch,
+                flow_loss,
+                text_provider,
+                cfg_dropout=OmegaConf.to_container(train_cfg.cfg_dropout, resolve=True),
+                constraint_prob=train_cfg.constraint_prob,
+                max_keyframes=train_cfg.max_keyframes,
+            )
 
-        loss.backward()
+            if not torch.isfinite(loss):
+                print_rank0(rank, f"ERROR: non-finite loss at step {step}: {loss.item()}")
+                return 1
+
+            (loss / grad_accum_steps).backward()
+            step_loss = metrics["loss"].item()
+            step_metrics = metrics
+
         grad_norm = torch.nn.utils.clip_grad_norm_(denoiser.parameters(), train_cfg.grad_clip)
         optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
         if lr_scheduler is not None:
             lr_scheduler.step()
+
+        if progress is not None:
+            progress.update(1)
 
         elapsed = time.perf_counter() - start_time
         steps_done = step - start_step + 1
         eta = elapsed / max(steps_done, 1) * (max_steps - step)
 
-        if step % log_every == 0 or step == 1:
+        if progress is not None and (step % log_every == 0 or step == 1):
+            assert step_metrics is not None
             progress.set_postfix(
-                loss=f"{metrics['loss'].item():.4f}",
+                epoch=f"{epoch_progress.epoch:.2f}/{epoch_progress.total_epochs:.0f}",
+                loss=f"{step_loss:.4f}",
                 grad=f"{float(grad_norm):.4f}",
                 elapsed=_format_duration(elapsed),
                 eta=_format_duration(eta),
                 refresh=False,
             )
             tqdm.write(
-                f"step {step}/{max_steps} "
-                f"loss={metrics['loss'].item():.6f} "
-                f"t_mean={metrics['t_mean'].item():.3f} "
+                f"step {step}/{max_steps} | {format_epoch_progress(epoch_progress)} "
+                f"| sampler_epoch={data_epoch} "
+                f"loss={step_loss:.6f} "
+                f"t_mean={step_metrics['t_mean'].item():.3f} "
                 f"grad_norm={float(grad_norm):.4f} "
                 f"elapsed={_format_duration(elapsed)} "
                 f"eta={_format_duration(eta)}"
             )
             wandb_logger.log_step(
                 step,
-                loss=metrics["loss"].item(),
+                loss=step_loss,
                 grad_norm=float(grad_norm),
-                t_mean=metrics["t_mean"].item(),
-                ut_norm=metrics["ut_norm"].item(),
-                v_norm=metrics["v_norm"].item(),
+                t_mean=step_metrics["t_mean"].item(),
+                ut_norm=step_metrics["ut_norm"].item(),
+                v_norm=step_metrics["v_norm"].item(),
                 lr=optimizer.param_groups[0]["lr"],
                 elapsed_sec=elapsed,
+                epoch=epoch_progress.epoch,
+                epoch_index=epoch_progress.epoch_index,
+                step_in_epoch=epoch_progress.step_in_epoch,
+                steps_per_epoch=epoch_progress.steps_per_epoch,
+                sampler_epoch=data_epoch,
             )
 
-        if step % int(train_cfg.save_every) == 0:
+        if step % save_every == 0 and is_main_process(rank):
+            bare_denoiser = unwrap_module(denoiser)
             ckpt_dir = save_training_checkpoint(
                 output_dir=args.output_dir / f"step_{step}",
-                denoiser=denoiser.cpu(),
+                denoiser=bare_denoiser.cpu(),
                 denoiser_cfg=denoiser_cfg,
                 training_cfg=OmegaConf.to_container(cfg, resolve=True),
                 stats_dir=stats_workdir,
             )
-            denoiser.to(device).train()
-            tqdm.write(f"saved checkpoint to {ckpt_dir}")
-            wandb_logger.log_checkpoint(step, str(ckpt_dir))
+            bare_denoiser.to(device)
+            denoiser.train()
+            print_rank0(
+                rank,
+                f"saved checkpoint to {ckpt_dir} ({format_epoch_progress(epoch_progress)})",
+            )
+            wandb_logger.log_checkpoint(step, str(ckpt_dir), epoch=epoch_progress.epoch)
+        if step % save_every == 0:
+            barrier()
 
-    save_every = int(train_cfg.save_every)
-    if max_steps % save_every != 0:
+    if max_steps % save_every != 0 and is_main_process(rank):
+        bare_denoiser = unwrap_module(denoiser)
         ckpt_dir = save_training_checkpoint(
             output_dir=args.output_dir / f"step_{max_steps}",
-            denoiser=denoiser.cpu(),
+            denoiser=bare_denoiser.cpu(),
             denoiser_cfg=denoiser_cfg,
             training_cfg=OmegaConf.to_container(cfg, resolve=True),
             stats_dir=stats_workdir,
         )
-        denoiser.to(device).train()
-        print(f"saved final checkpoint to {ckpt_dir}")
-        wandb_logger.log_checkpoint(max_steps, str(ckpt_dir))
+        bare_denoiser.to(device)
+        denoiser.train()
+        print_rank0(
+            rank,
+            f"saved final checkpoint to {ckpt_dir} "
+            f"({format_epoch_progress(StepEpochProgress.at_step(max_steps, epoch_schedule))})",
+        )
+        wandb_logger.log_checkpoint(
+            max_steps,
+            str(ckpt_dir),
+            epoch=StepEpochProgress.at_step(max_steps, epoch_schedule).epoch,
+        )
+    barrier()
 
     total_time = time.perf_counter() - start_time
-    print(f"Training completed in {_format_duration(total_time)}")
+    print_rank0(rank, f"Training completed in {_format_duration(total_time)}")
     wandb_logger.finish()
 
-    denoiser.eval()
-    with torch.no_grad():
-        batch = next(iter(loader))
-        if "text_feat" in batch:
-            text_feat = batch["text_feat"].to(device)
-            text_pad_mask = batch["text_pad_mask"].to(device)
-        else:
-            text_feat, text_pad_mask = text_provider.encode(batch["texts"])
-        pad_mask = batch["pad_mask"].to(device)
-        b, t, d = batch["feats"].shape
-        x = torch.randn(b, t, d, device=device)
-        dt = 1.0 / 5
-        heading = torch.zeros(b, device=device)
-        for i in range(5):
-            t_batch = torch.full((b,), 1.0 - i * dt, device=device)
-            v = denoiser(
-                x,
-                pad_mask,
-                text_feat,
-                text_pad_mask,
-                t_batch,
-                first_heading_angle=heading,
+    if is_main_process(rank):
+        bare_denoiser = unwrap_module(denoiser)
+        bare_denoiser.eval()
+        with torch.no_grad():
+            batch = next(iter(loader))
+            if "text_feat" in batch:
+                text_feat = batch["text_feat"].to(device)
+                text_pad_mask = batch["text_pad_mask"].to(device)
+            else:
+                text_feat, text_pad_mask = text_provider.encode(batch["texts"])
+            pad_mask = batch["pad_mask"].to(device)
+            b, t, d = batch["feats"].shape
+            x = torch.randn(b, t, d, device=device)
+            dt = 1.0 / 5
+            heading = torch.zeros(b, device=device)
+            for i in range(5):
+                t_batch = torch.full((b,), 1.0 - i * dt, device=device)
+                v = bare_denoiser(
+                    x,
+                    pad_mask,
+                    text_feat,
+                    text_pad_mask,
+                    t_batch,
+                    first_heading_angle=heading,
+                )
+                x = x - dt * v
+            print_rank0(rank, f"inference smoke ok: output shape {tuple(x.shape)}")
+
+        if args.smoke:
+            ckpt_dir = save_training_checkpoint(
+                output_dir=args.output_dir / "smoke_final",
+                denoiser=bare_denoiser.cpu(),
+                denoiser_cfg=denoiser_cfg,
+                training_cfg=OmegaConf.to_container(cfg, resolve=True),
+                stats_dir=stats_workdir,
             )
-            x = x - dt * v
-        print(f"inference smoke ok: output shape {tuple(x.shape)}")
+            bare_denoiser.to(device)
+            print_rank0(rank, f"saved smoke checkpoint to {ckpt_dir}")
 
-    if args.smoke:
-        ckpt_dir = save_training_checkpoint(
-            output_dir=args.output_dir / "smoke_final",
-            denoiser=denoiser.cpu(),
-            denoiser_cfg=denoiser_cfg,
-            training_cfg=OmegaConf.to_container(cfg, resolve=True),
-            stats_dir=stats_workdir,
-        )
-        denoiser.to(device)
-        print(f"saved smoke checkpoint to {ckpt_dir}")
+    if distributed:
+        dist.destroy_process_group()
 
-    print("TRAIN PASSED" if args.smoke else "Training finished.")
+    print_rank0(rank, "TRAIN PASSED" if args.smoke else "Training finished.")
     return 0
 
 

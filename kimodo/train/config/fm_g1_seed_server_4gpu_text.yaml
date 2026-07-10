@@ -1,0 +1,12 @@
+# Text-conditioned 4-GPU overrides (precomputed LLM2Vec cache; no GPU text encoder in loop).
+training:
+  lr: 8.0e-4
+
+text_cache:
+  enabled: true
+  dir: datasets/bones-seed/cache/llm2vec_g1_train
+  auto_precompute: true
+
+text_encoder:
+  dtype: float32
+  device: auto

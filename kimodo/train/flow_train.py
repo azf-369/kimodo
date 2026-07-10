@@ -17,6 +17,10 @@ from kimodo.train.cfg_dropout import apply_separated_cfg_dropout
 from kimodo.train.constraint_synth import sample_training_constraints
 
 
+def _denoiser_core(denoiser: nn.Module) -> nn.Module:
+    return denoiser.module if hasattr(denoiser, "module") else denoiser
+
+
 def _randomize_batch_heading(
     motion_rep: KimodoMotionRep,
     x1: Tensor,
@@ -59,7 +63,7 @@ def flow_matching_train_step(
     device = x1.device
 
     if text_feat is None:
-        root_model = denoiser.root_model
+        root_model = _denoiser_core(denoiser).root_model
         num_tokens = root_model.num_text_tokens
         llm_dim = root_model.embed_text.in_features
         text_feat = torch.zeros(batch_size, num_tokens, llm_dim, device=device)
@@ -110,7 +114,7 @@ def flow_matching_batch_step(
     lengths = batch["lengths"].to(device)
 
     first_heading_angle: Optional[Tensor] = None
-    if getattr(denoiser.root_model, "input_first_heading_angle", False):
+    if getattr(_denoiser_core(denoiser).root_model, "input_first_heading_angle", False):
         x1, first_heading_angle = _randomize_batch_heading(motion_rep, x1)
 
     if "text_feat" in batch and "text_pad_mask" in batch:

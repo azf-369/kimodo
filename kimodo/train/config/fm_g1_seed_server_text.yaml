@@ -1,9 +1,8 @@
 # Extra overrides when training with --text-mode encoder on H100.
 # Uses precomputed LLM2Vec embeddings so training matches no-text throughput.
 training:
-  batch_size: 48
-  num_workers: 12
-  # batch 48 vs official 4: ~12x; use 6e-4 (between sqrt/linear) for text+constraint stability.
+  # batch_size is set by fm_g1_seed_server.yaml or fm_g1_seed_server_4gpu*.yaml
+  # ~linear LR scale from official batch_size=4 / lr=1e-4 (48/4 = 12x, use 6e-4 for text+constraint stability).
   lr: 6.0e-4
   warmup_steps: 5000
 

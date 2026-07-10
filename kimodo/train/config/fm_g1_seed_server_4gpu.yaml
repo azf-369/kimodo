@@ -1,0 +1,15 @@
+# 4x H100 80GB DDP overrides (use with torchrun --nproc_per_node=4).
+# Official 4-GPU batch: 4 x 128 = 512 global (no gradient accumulation).
+training:
+  batch_size: 128
+  gradient_accumulation_steps: 1
+  num_workers: 8
+  # Reference: official DDPM uses lr=2e-5 @ global batch 2048.
+  # FM base in this repo: lr=1e-4 @ global batch 4 (sqrt scale to 512 -> ~1.1e-3).
+  lr: 1.0e-3
+  lr_scaling: sqrt
+  lr_reference_batch: 4
+  warmup_steps: 10000
+  max_steps: 1000000
+  # ~250 steps/epoch @ global batch 512 on SEED train split -> 100 epochs ≈ 25k steps.
+  save_every_epochs: 100

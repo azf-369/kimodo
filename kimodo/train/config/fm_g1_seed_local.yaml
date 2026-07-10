@@ -3,3 +3,4 @@ training:
   max_frames: 300
   batch_size: 2
   num_workers: 0
+  max_steps: 200000
