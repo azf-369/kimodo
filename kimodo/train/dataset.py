@@ -54,6 +54,9 @@ class G1SeedTrainingDataset(Dataset):
         text_field: str = "content_natural_desc_4",
         normalize: bool = True,
         require_text: bool = True,
+        text_cache_dir: str | Path | None = None,
+        text_cache_num_tokens: int = 50,
+        text_cache_llm_dim: int = 4096,
     ):
         self.data_root = Path(data_root)
         self.max_frames = max_frames
@@ -63,6 +66,9 @@ class G1SeedTrainingDataset(Dataset):
         self.text_field = text_field
         self.normalize = normalize
         self.require_text = require_text
+        self.text_cache_dir = Path(text_cache_dir) if text_cache_dir is not None else None
+        self.text_cache_num_tokens = text_cache_num_tokens
+        self.text_cache_llm_dim = text_cache_llm_dim
 
         metadata_path = Path(metadata_path or self.data_root / "metadata" / "seed_metadata_v004.csv")
         if not metadata_path.is_file():
@@ -132,12 +138,27 @@ class G1SeedTrainingDataset(Dataset):
         else:
             length = feats.shape[0]
 
-        return {
+        item = {
             "feats": feats.float(),
             "length": length,
             "path": str(sample["path"]),
             "text": sample["text"],
+            "rel_path": sample["rel_path"],
         }
+        if self.text_cache_dir is not None:
+            from kimodo.train.text_cache import cache_path_for_rel_path, load_text_embedding
+
+            cache_path = cache_path_for_rel_path(self.text_cache_dir, sample["rel_path"])
+            if not cache_path.is_file():
+                raise FileNotFoundError(f"Missing text embedding cache: {cache_path}")
+            text_feat, text_pad_mask = load_text_embedding(
+                cache_path,
+                num_tokens=self.text_cache_num_tokens,
+                llm_dim=self.text_cache_llm_dim,
+            )
+            item["text_feat"] = text_feat
+            item["text_pad_mask"] = text_pad_mask
+        return item
 
 
 # Backward-compatible alias used by the initial smoke test.

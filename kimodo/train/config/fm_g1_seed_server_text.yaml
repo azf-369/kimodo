@@ -1,0 +1,18 @@
+# Extra overrides when training with --text-mode encoder on H100.
+# Uses precomputed LLM2Vec embeddings so training matches no-text throughput.
+training:
+  batch_size: 48
+  num_workers: 12
+  # batch 48 vs official 4: ~12x; use 6e-4 (between sqrt/linear) for text+constraint stability.
+  lr: 6.0e-4
+  warmup_steps: 5000
+
+text_encoder:
+  # Keep float32 for LLM2Vec; lower precision can shift text embeddings.
+  dtype: float32
+  device: auto
+
+text_cache:
+  enabled: true
+  dir: datasets/bones-seed/cache/llm2vec_g1_train
+  auto_precompute: true

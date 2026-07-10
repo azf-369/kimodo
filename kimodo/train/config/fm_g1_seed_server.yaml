@@ -1,0 +1,20 @@
+# H100 80GB server overrides (single-GPU training on BONES-SEED).
+# Tuned for: 192 CPU cores, 2TB RAM, NVIDIA H100 80GB.
+# Use with: python -m kimodo.train.scripts.train_fm --server ...
+#
+# Benchmarked on this machine (no-text, max_frames=300):
+#   batch_size=48 -> ~29 GB peak VRAM, leaves headroom for AdamW + CUDA cache.
+#   num_workers=12 feeds the GPU while keeping CPU preprocessing parallel.
+training:
+  max_frames: 300
+  batch_size: 48
+  num_workers: 12
+  # ~linear LR scale from official batch_size=4 / lr=1e-4 (48/4 = 12x, use 8e-4 for stability).
+  lr: 8.0e-4
+  warmup_steps: 2000
+  grad_clip: 1.0
+
+dataloader:
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 4

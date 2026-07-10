@@ -188,6 +188,11 @@ uv pip install -e ".[train]"
 
 wandb login
 
+# 下载有文本训练依赖内容：
+hf download McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp
+hf download McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp-supervised
+hf download meta-llama/Meta-Llama-3-8B-Instruct
+
 python -m kimodo.train.scripts.train_fm \
   --no-text \
   --data-root datasets/bones-seed \
@@ -202,6 +207,18 @@ python -m kimodo.train.scripts.train_fm \
 
 
 ## 在服务器上进行训练：
+
+**H100 服务器优化配置**（`--server` → `fm_g1_seed_server.yaml`）：
+
+| 参数 | 官方默认 | 服务器优化 | 说明 |
+|------|---------|-----------|------|
+| batch_size | 4 | **48** | 实测峰值 ~29GB / 80GB，充分利用显存 |
+| num_workers | 2 | **12** | 192 核 CPU，缓解数据加载瓶颈 |
+| lr | 1e-4 | **8e-4** | 按 batch 线性缩放（保守 80%） |
+| warmup_steps | 1000 | **2000** | 配合更大 batch |
+| dataloader | - | pin_memory + persistent_workers + prefetch=4 | 加速 CPU→GPU 传输 |
+
+有文本训练时额外合并 `fm_g1_seed_server_text.yaml`（batch_size=16, lr=4e-4），建议 `export TEXT_ENCODER_DEVICE=cpu`。
 
 ```bash
 cd /data_sjy/jf
@@ -290,29 +307,90 @@ source .venv/bin/activate
 python -m kimodo.train.scripts.train_fm \
   --smoke \
   --no-text \
-  --device cpu \
+  --device gpu \
   --max-files 4
 
-tmux new -s train
+# 无文本训练：
+tmux new -s kimodo_train_2
 export http_proxy=http://10.127.48.11:3128/
 export https_proxy=http://10.127.48.11:3128/
 export HTTP_PROXY=$http_proxy
 export HTTPS_PROXY=$https_proxy
 export WANDB_API_KEY="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"
 source .venv/bin/activate
-export CUDA_VISIBLE_DEVICES=3
+export CUDA_VISIBLE_DEVICES=1
 python -m kimodo.train.scripts.train_fm \
+  --server \
   --no-text \
   --data-root datasets/bones-seed \
   --split-path datasets/kimodo-benchmark/splits/train_split_paths.txt \
   --stats-path checkpoints/Kimodo-G1-SEED-v1/stats/motion \
-  --output-dir outputs/fm_g1_seed_no_text \
+  --output-dir outputs/fm_g1_seed_no_text_experiment_1 \
   --device cuda \
   --wandb \
   --wandb-project kimodo-fm-g1 \
-  --wandb-run-name g1-notext-server
+  --wandb-run-name g1-notext-server-experiment_1
 
-tmux attach -t train
+## 全量训练（有文本）：
+# H100 服务器配置见 kimodo/train/config/fm_g1_seed_server.yaml
+# 有文本时自动合并 fm_g1_seed_server_text.yaml（batch_size=16）
+# 建议 TEXT_ENCODER_DEVICE=cpu，把 GPU 显存留给 denoiser
+tmux new -s train_text
+# tmux attach -t train_text
+cd /data_sjy/jf/kimodo
+source .venv/bin/activate
+export http_proxy=http://10.127.48.11:3128/
+export https_proxy=http://10.127.48.11:3128/
+export HTTP_PROXY=$http_proxy
+export HTTPS_PROXY=$https_proxy
+export WANDB_API_KEY="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"
+# 如需代理 / 指定 GPU / WandB（按你服务器习惯保留）
+export CUDA_VISIBLE_DEVICES=0
+unset TEXT_ENCODER_DEVICE
+
+# 如果卡住，重新登录hf为我的账号
+
+python -m kimodo.train.scripts.train_fm \
+  --server \
+  --text-mode encoder \
+  --data-root datasets/bones-seed \
+  --split-path datasets/kimodo-benchmark/splits/train_split_paths.txt \
+  --stats-path checkpoints/Kimodo-G1-SEED-v1/stats/motion \
+  --output-dir outputs/fm_g1_seed \
+  --device cuda \
+  --wandb \
+  --wandb-project kimodo-fm-g1 \
+  --wandb-run-name g1-text-server
+```
+
+### kimodo_train_1
+```bash
+使用预缓存文本来提高训练速度：
+python -m kimodo.train.scripts.precompute_text_embeddings \
+  --server \
+  --data-root datasets/bones-seed \
+  --split-path datasets/kimodo-benchmark/splits/train_split_paths.txt \
+  --force
+
+source .venv/bin/activate
+export http_proxy=http://10.127.48.11:3128/
+export https_proxy=http://10.127.48.11:3128/
+export HTTP_PROXY=$http_proxy
+export HTTPS_PROXY=$https_proxy
+export WANDB_API_KEY="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"
+export CUDA_VISIBLE_DEVICES=0
+unset TEXT_ENCODER_DEVICE
+python -m kimodo.train.scripts.train_fm \
+  --server \
+  --text-mode encoder \
+  --data-root datasets/bones-seed \
+  --split-path datasets/kimodo-benchmark/splits/train_split_paths.txt \
+  --stats-path checkpoints/Kimodo-G1-SEED-v1/stats/motion \
+  --output-dir outputs/fm_g1_seed_experiment_1 \
+  --device cuda \
+  --wandb \
+  --wandb-project kimodo-fm-g1 \
+  --wandb-run-name g1-text-server-experiment_1
 ```
 
 ## 使用本地配置进行训练：
@@ -392,6 +470,7 @@ kimodo_demo --model g1-seed
 # pip config set global.trusted-host 10.127.48.3
 
 # 编译：
+```bash
 cd /data_sjy/jf/kimodo
 source .venv/bin/activate
 export http_proxy=http://10.127.48.11:3128/
@@ -430,4 +509,41 @@ hf download bones-studio/seed \
   --include "metadata/*" \
   --include "LICENSE.md" \
   --include "README.md"
+```
+
+## 需下载文件（未验证）：
+cd /data_sjy/jf/kimodo
+source .venv/bin/activate
+
+# 按需设置代理
+# export http_proxy=... https_proxy=...
+
+export HF_HOME=/data_sjy/jf/kimodo/models/huggingface
+export HUGGINGFACE_CACHE_DIR=$HF_HOME/hub
+mkdir -p "$HUGGINGFACE_CACHE_DIR" checkpoints/Kimodo-G1-SEED-v1 datasets/kimodo-benchmark datasets/bones-seed
+
+hf auth login
+
+# 文本编码器
+hf download McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp
+hf download McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp-supervised
+hf download meta-llama/Meta-Llama-3-8B-Instruct
+
+# stats + split
+hf download nvidia/Kimodo-G1-SEED-v1 \
+  stats/motion/global_root/mean.npy stats/motion/global_root/std.npy \
+  stats/motion/local_root/mean.npy stats/motion/local_root/std.npy \
+  stats/motion/body/mean.npy stats/motion/body/std.npy \
+  --local-dir checkpoints/Kimodo-G1-SEED-v1
+
+hf download nvidia/Kimodo-Motion-Gen-Benchmark \
+  splits/train_split_paths.txt \
+  --repo-type dataset \
+  --local-dir datasets/kimodo-benchmark
+
+# 数据集（体积大，建议单独 tmux）
+hf download bones-studio/seed \
+  --repo-type dataset \
+  --local-dir datasets/bones-seed \
+  --include "g1.tar.gz" --include "metadata/*"
 ```

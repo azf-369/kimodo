@@ -113,7 +113,11 @@ def flow_matching_batch_step(
     if getattr(denoiser.root_model, "input_first_heading_angle", False):
         x1, first_heading_angle = _randomize_batch_heading(motion_rep, x1)
 
-    text_feat, text_pad_mask = text_provider.encode(batch["texts"])
+    if "text_feat" in batch and "text_pad_mask" in batch:
+        text_feat = batch["text_feat"].to(device)
+        text_pad_mask = batch["text_pad_mask"].to(device)
+    else:
+        text_feat, text_pad_mask = text_provider.encode(batch["texts"])
     motion_mask, observed_motion = sample_training_constraints(
         motion_rep,
         x1,

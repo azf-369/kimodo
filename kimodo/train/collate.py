@@ -23,10 +23,21 @@ def collate_motion_batch(samples: list[dict]) -> dict:
         pad_mask[i, :length] = True
         lengths[i] = length
 
-    return {
+    batch = {
         "feats": feats,
         "pad_mask": pad_mask,
         "lengths": lengths,
         "paths": [s["path"] for s in samples],
         "texts": [s["text"] for s in samples],
     }
+    if "text_feat" in samples[0]:
+        num_tokens = samples[0]["text_feat"].shape[0]
+        llm_dim = samples[0]["text_feat"].shape[-1]
+        text_feat = torch.zeros(batch_size, num_tokens, llm_dim, dtype=torch.float32)
+        text_pad_mask = torch.zeros(batch_size, num_tokens, dtype=torch.bool)
+        for i, sample in enumerate(samples):
+            text_feat[i] = sample["text_feat"]
+            text_pad_mask[i] = sample["text_pad_mask"]
+        batch["text_feat"] = text_feat
+        batch["text_pad_mask"] = text_pad_mask
+    return batch

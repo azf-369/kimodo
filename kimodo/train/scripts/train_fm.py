@@ -23,6 +23,11 @@ from kimodo.train.collate import collate_motion_batch
 from kimodo.train.dataset import G1SeedTrainingDataset
 from kimodo.train.flow_train import flow_matching_batch_step
 from kimodo.train.stats_compute import compute_motion_stats, save_motion_stats
+from kimodo.train.text_cache import (
+    count_missing_embeddings,
+    precompute_text_embeddings,
+    resolve_text_cache_dir,
+)
 from kimodo.train.text_embedding import TextEmbeddingProvider
 from kimodo.train.utils import apply_no_text_overrides, load_train_config
 from kimodo.train.wandb_log import WandbLogger
@@ -47,7 +52,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Merge fm_g1_seed_local.yaml (batch_size=2, num_workers=0; full model size).",
     )
+    parser.add_argument(
+        "--server",
+        action="store_true",
+        help="Merge fm_g1_seed_server.yaml (H100 80GB: batch_size=48, num_workers=12).",
+    )
     parser.add_argument("--batch-size", type=int, default=None, help="Override training.batch_size.")
+    parser.add_argument("--num-workers", type=int, default=None, help="Override training.num_workers.")
     parser.add_argument("--max-frames", type=int, default=None, help="Override training.max_frames.")
     parser.add_argument("--max-steps", type=int, default=None, help="Override training.max_steps.")
     parser.add_argument("--data-root", type=Path, default=Path("datasets/bones-seed"))
@@ -80,6 +91,17 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Resume model weights from a prior training checkpoint dir (e.g. outputs/.../step_10000).",
     )
+    parser.add_argument(
+        "--text-cache-dir",
+        type=Path,
+        default=None,
+        help="Directory of precomputed LLM2Vec embeddings (overrides config text_cache.dir).",
+    )
+    parser.add_argument(
+        "--precompute-text-cache",
+        action="store_true",
+        help="Precompute missing text embeddings before training (also when text_cache.auto_precompute is true).",
+    )
     return parser.parse_args()
 
 
@@ -103,8 +125,13 @@ def main() -> int:
     if args.local:
         local_cfg = load_train_config("fm_g1_seed_local")
         cfg = OmegaConf.merge(cfg, local_cfg)
+    if args.server:
+        server_cfg = load_train_config("fm_g1_seed_server")
+        cfg = OmegaConf.merge(cfg, server_cfg)
     if args.batch_size is not None:
         cfg.training.batch_size = args.batch_size
+    if args.num_workers is not None:
+        cfg.training.num_workers = args.num_workers
     if args.max_frames is not None:
         cfg.training.max_frames = args.max_frames
     if args.max_steps is not None:
@@ -114,7 +141,14 @@ def main() -> int:
             print("WARNING: --no-text forces --text-mode dummy (LLM2Vec is not used).", file=sys.stderr)
         args.text_mode = "dummy"
         cfg = apply_no_text_overrides(cfg)
+    if args.server and args.text_mode == "encoder" and not args.no_text:
+        text_server_cfg = load_train_config("fm_g1_seed_server_text")
+        cfg = OmegaConf.merge(cfg, text_server_cfg)
     train_cfg = cfg.training
+    text_cache_dir = resolve_text_cache_dir(cfg, args.text_cache_dir)
+    use_text_cache = text_cache_dir is not None and not args.no_text and args.text_mode == "encoder"
+    text_cache_cfg = OmegaConf.to_container(cfg.get("text_cache", {}), resolve=True) if "text_cache" in cfg else {}
+    auto_precompute = bool(text_cache_cfg.get("auto_precompute", False)) or args.precompute_text_cache
 
     if not args.data_root.is_dir():
         print(f"ERROR: data root not found: {args.data_root}", file=sys.stderr)
@@ -172,6 +206,14 @@ def main() -> int:
     # CUDA tensors after fork (denoiser.motion_rep lives on GPU when --device cuda).
     cpu_motion_rep = build_motion_rep(cfg.denoiser, stats_path=str(stats_path))
 
+    denoiser_cfg = OmegaConf.to_container(cfg.denoiser, resolve=True)
+    llm_dim = denoiser_cfg["llm_shape"][-1]
+    if denoiser_cfg.get("num_text_tokens_override") is not None:
+        num_tokens = denoiser_cfg["num_text_tokens_override"]
+    else:
+        num_tokens = denoiser_cfg["llm_shape"][0]
+    encoder_cfg = OmegaConf.to_container(cfg.text_encoder, resolve=True) if "text_encoder" in cfg else None
+
     dataset = G1SeedTrainingDataset(
         args.data_root,
         metadata_path=args.metadata,
@@ -183,30 +225,58 @@ def main() -> int:
         motion_rep=cpu_motion_rep,
         normalize=True,
         require_text=not args.no_text,
+        text_cache_dir=text_cache_dir if use_text_cache else None,
+        text_cache_num_tokens=num_tokens,
+        text_cache_llm_dim=llm_dim,
     )
-    loader = DataLoader(
-        dataset,
-        batch_size=min(train_cfg.batch_size, len(dataset)),
-        shuffle=True,
-        num_workers=train_cfg.num_workers,
-        collate_fn=collate_motion_batch,
-        drop_last=len(dataset) >= train_cfg.batch_size,
-    )
+
+    if use_text_cache:
+        assert text_cache_dir is not None
+        missing = count_missing_embeddings(dataset.samples, text_cache_dir)
+        if missing > 0:
+            if not auto_precompute:
+                print(
+                    f"ERROR: {missing} text embeddings missing under {text_cache_dir}. "
+                    "Run with --precompute-text-cache or set text_cache.auto_precompute: true.",
+                    file=sys.stderr,
+                )
+                return 1
+            print(f"Precomputing {missing} missing text embeddings into {text_cache_dir} ...")
+            precompute_text_embeddings(
+                dataset.samples,
+                cache_dir=text_cache_dir,
+                encoder_cfg=encoder_cfg,
+                num_tokens=num_tokens,
+                llm_dim=llm_dim,
+                device=device,
+            )
+        print(f"Using precomputed text embeddings from {text_cache_dir}")
+
+    num_workers = int(train_cfg.num_workers)
+    dl_cfg = OmegaConf.to_container(cfg.get("dataloader", {}), resolve=True) if "dataloader" in cfg else {}
+    pin_memory = bool(dl_cfg.get("pin_memory", device.type == "cuda"))
+    loader_kwargs: dict = {
+        "batch_size": min(train_cfg.batch_size, len(dataset)),
+        "shuffle": True,
+        "num_workers": num_workers,
+        "collate_fn": collate_motion_batch,
+        "drop_last": len(dataset) >= train_cfg.batch_size,
+    }
+    if pin_memory:
+        loader_kwargs["pin_memory"] = True
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = bool(dl_cfg.get("persistent_workers", True))
+        loader_kwargs["prefetch_factor"] = int(dl_cfg.get("prefetch_factor", 2))
+    loader = DataLoader(dataset, **loader_kwargs)
     data_iter = itertools.cycle(loader)
 
-    denoiser_cfg = OmegaConf.to_container(cfg.denoiser, resolve=True)
-    llm_dim = denoiser_cfg["llm_shape"][-1]
-    if denoiser_cfg.get("num_text_tokens_override") is not None:
-        num_tokens = denoiser_cfg["num_text_tokens_override"]
-    else:
-        num_tokens = denoiser_cfg["llm_shape"][0]
-    encoder_cfg = OmegaConf.to_container(cfg.text_encoder, resolve=True) if "text_encoder" in cfg else None
+    text_provider_mode = "dummy" if use_text_cache else args.text_mode
     text_provider = TextEmbeddingProvider(
         num_tokens=num_tokens,
         llm_dim=llm_dim,
         device=device,
-        mode=args.text_mode,
-        encoder_cfg=encoder_cfg,
+        mode=text_provider_mode,
+        encoder_cfg=None if use_text_cache else encoder_cfg,
     )
 
     flow_cfg = cfg.flow_matching
@@ -254,7 +324,9 @@ def main() -> int:
     print(
         f"Device: {device} | clips: {len(dataset)} | feat_dim: {motion_rep.motion_rep_dim} "
         f"| max_steps: {max_steps} | start_step: {start_step} | text_mode: {args.text_mode} "
+        f"| text_cache: {text_cache_dir if use_text_cache else 'off'} "
         f"| no_text: {args.no_text} | text_tokens: {text_tokens} "
+        f"| batch_size: {train_cfg.batch_size} | lr: {train_cfg.lr} "
         f"| num_workers: {train_cfg.num_workers} | stats_dir: {stats_workdir}"
     )
 
@@ -352,7 +424,11 @@ def main() -> int:
     denoiser.eval()
     with torch.no_grad():
         batch = next(iter(loader))
-        text_feat, text_pad_mask = text_provider.encode(batch["texts"])
+        if "text_feat" in batch:
+            text_feat = batch["text_feat"].to(device)
+            text_pad_mask = batch["text_pad_mask"].to(device)
+        else:
+            text_feat, text_pad_mask = text_provider.encode(batch["texts"])
         pad_mask = batch["pad_mask"].to(device)
         b, t, d = batch["feats"].shape
         x = torch.randn(b, t, d, device=device)
