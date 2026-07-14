@@ -6,9 +6,11 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 import torch
 import torch.distributed as dist
@@ -44,6 +46,11 @@ from kimodo.train.training_progress import (
     StepEpochProgress,
     format_epoch_progress,
     resolve_save_every_steps,
+)
+from kimodo.train.resource_guard import (
+    DataLoaderTuning,
+    ResourceGuard,
+    cap_dataloader_at_startup,
 )
 from kimodo.train.utils import apply_no_text_overrides, load_train_config
 from kimodo.train.wandb_log import WandbLogger
@@ -149,6 +156,36 @@ def _next_batch(data_iter, loader, sampler, epoch: int):
             sampler.set_epoch(epoch)
         data_iter = iter(loader)
         return next(data_iter), data_iter, epoch
+
+
+def _build_motion_dataloader(
+    dataset: G1SeedTrainingDataset,
+    *,
+    per_gpu_batch: int,
+    tuning: DataLoaderTuning,
+    pin_memory: bool,
+    distributed: bool,
+) -> tuple[DataLoader, Optional[DistributedSampler], bool]:
+    sampler = None
+    loader_kwargs: dict = {
+        "batch_size": per_gpu_batch,
+        "num_workers": tuning.num_workers,
+        "collate_fn": collate_motion_batch,
+        "drop_last": len(dataset) >= per_gpu_batch,
+    }
+    if distributed:
+        sampler = DistributedSampler(dataset, shuffle=True, drop_last=loader_kwargs["drop_last"])
+        loader_kwargs["sampler"] = sampler
+        loader_kwargs["shuffle"] = False
+    else:
+        loader_kwargs["shuffle"] = True
+    if pin_memory:
+        loader_kwargs["pin_memory"] = True
+    if tuning.num_workers > 0:
+        loader_kwargs["persistent_workers"] = tuning.persistent_workers
+        loader_kwargs["prefetch_factor"] = tuning.prefetch_factor
+    loader = DataLoader(dataset, **loader_kwargs)
+    return loader, sampler, bool(loader_kwargs["drop_last"])
 
 
 def main() -> int:
@@ -321,31 +358,43 @@ def main() -> int:
         barrier()
         print_rank0(rank, f"Using precomputed text embeddings from {text_cache_dir}")
 
-    num_workers = int(train_cfg.num_workers)
+    requested_workers = int(train_cfg.num_workers)
+    num_workers = requested_workers
     dl_cfg = OmegaConf.to_container(cfg.get("dataloader", {}), resolve=True) if "dataloader" in cfg else {}
     pin_memory = bool(dl_cfg.get("pin_memory", device.type == "cuda"))
     per_gpu_batch = min(per_gpu_batch, len(dataset))
-    sampler = None
-    if distributed:
-        sampler = DistributedSampler(dataset, shuffle=True, drop_last=len(dataset) >= per_gpu_batch)
-    loader_kwargs: dict = {
-        "batch_size": per_gpu_batch,
-        "num_workers": num_workers,
-        "collate_fn": collate_motion_batch,
-        "drop_last": len(dataset) >= per_gpu_batch,
-    }
-    if sampler is not None:
-        loader_kwargs["sampler"] = sampler
-        loader_kwargs["shuffle"] = False
+    requested_prefetch = int(dl_cfg.get("prefetch_factor", 2))
+    rg_cfg = OmegaConf.to_container(cfg.get("resource_guard", {}), resolve=True) if "resource_guard" in cfg else {}
+    if rg_cfg.get("enabled", False):
+        tuning, rg_msg = cap_dataloader_at_startup(
+            requested_workers=requested_workers,
+            requested_prefetch=requested_prefetch,
+            world_size=world_size,
+            reserve_gb=float(rg_cfg.get("reserve_gb", 16.0)),
+            gb_per_worker=float(rg_cfg.get("gb_per_worker", 2.5)),
+            min_workers=int(rg_cfg.get("min_num_workers", 0)),
+            min_prefetch=int(rg_cfg.get("min_prefetch_factor", 1)),
+            mem_prefetch_cap_ratio=float(rg_cfg.get("mem_prefetch_cap_ratio", 0.70)),
+        )
+        print_rank0(rank, rg_msg)
     else:
-        loader_kwargs["shuffle"] = True
-    if pin_memory:
-        loader_kwargs["pin_memory"] = True
-    if num_workers > 0:
-        loader_kwargs["persistent_workers"] = bool(dl_cfg.get("persistent_workers", True))
-        loader_kwargs["prefetch_factor"] = int(dl_cfg.get("prefetch_factor", 2))
-    loader = DataLoader(dataset, **loader_kwargs)
-    drop_last = bool(loader_kwargs["drop_last"])
+        tuning = DataLoaderTuning(
+            num_workers=requested_workers,
+            prefetch_factor=requested_prefetch,
+            persistent_workers=bool(dl_cfg.get("persistent_workers", True)) and requested_workers > 0,
+        )
+    num_workers = tuning.num_workers
+    resource_guard = ResourceGuard.from_config(rg_cfg if rg_cfg else None, world_size=world_size, initial=tuning)
+    resource_guard.requested_workers = requested_workers
+    resource_guard.requested_prefetch = requested_prefetch
+
+    loader, sampler, drop_last = _build_motion_dataloader(
+        dataset,
+        per_gpu_batch=per_gpu_batch,
+        tuning=resource_guard.current_tuning(),
+        pin_memory=pin_memory,
+        distributed=distributed,
+    )
     epoch_schedule = EpochSchedule.from_training(
         num_samples=len(dataset),
         global_batch_size=effective_global_batch,
@@ -435,7 +484,9 @@ def main() -> int:
         f"| global_batch: {effective_global_batch} | lr: {train_cfg.lr} "
         f"| steps/epoch: {epoch_schedule.steps_per_epoch} "
         f"| epochs≈{epoch_schedule.total_epochs:.1f} | save_every: {save_every} steps "
-        f"| num_workers: {num_workers} | stats_dir: {stats_workdir}",
+        f"| num_workers: {num_workers} | prefetch: {tuning.prefetch_factor} "
+        f"| resource_guard: {'on' if resource_guard.cfg.enabled else 'off'} "
+        f"| stats_dir: {stats_workdir}",
     )
 
     if lr_scheduler is not None and start_step > 1:
@@ -467,6 +518,26 @@ def main() -> int:
                     f"--- dataloader epoch {data_epoch} started "
                     f"(optimizer {format_epoch_progress(epoch_progress)}) ---",
                 )
+                if resource_guard.consume_reload_request():
+                    tuning = resource_guard.current_tuning()
+                    num_workers = tuning.num_workers
+                    del loader
+                    loader, sampler, drop_last = _build_motion_dataloader(
+                        dataset,
+                        per_gpu_batch=per_gpu_batch,
+                        tuning=tuning,
+                        pin_memory=pin_memory,
+                        distributed=distributed,
+                    )
+                    if sampler is not None:
+                        sampler.set_epoch(data_epoch)
+                    data_iter = iter(loader)
+                    print_rank0(
+                        rank,
+                        f"resource_guard: reloaded DataLoader "
+                        f"(workers={tuning.num_workers}, prefetch={tuning.prefetch_factor})",
+                    )
+                    barrier()
             loss, metrics = flow_matching_batch_step(
                 denoiser,
                 motion_rep,
@@ -534,47 +605,60 @@ def main() -> int:
                 sampler_epoch=data_epoch,
             )
 
-        if step % save_every == 0 and is_main_process(rank):
-            bare_denoiser = unwrap_module(denoiser)
-            ckpt_dir = save_training_checkpoint(
-                output_dir=args.output_dir / f"step_{step}",
-                denoiser=bare_denoiser.cpu(),
-                denoiser_cfg=denoiser_cfg,
-                training_cfg=OmegaConf.to_container(cfg, resolve=True),
-                stats_dir=stats_workdir,
-            )
-            bare_denoiser.to(device)
-            denoiser.train()
-            print_rank0(
-                rank,
-                f"saved checkpoint to {ckpt_dir} ({format_epoch_progress(epoch_progress)})",
-            )
-            wandb_logger.log_checkpoint(step, str(ckpt_dir), epoch=epoch_progress.epoch)
+        guard_msg = resource_guard.check(step)
+        if guard_msg is not None:
+            print_rank0(rank, guard_msg)
+
         if step % save_every == 0:
             barrier()
+            if is_main_process(rank):
+                bare_denoiser = unwrap_module(denoiser)
+                denoiser.train()
+                with torch.inference_mode():
+                    ckpt_dir = save_training_checkpoint(
+                        output_dir=args.output_dir / f"step_{step}",
+                        denoiser=bare_denoiser,
+                        denoiser_cfg=denoiser_cfg,
+                        training_cfg=OmegaConf.to_container(cfg, resolve=True),
+                        stats_dir=stats_workdir,
+                    )
+                gc.collect()
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+                print_rank0(
+                    rank,
+                    f"saved checkpoint to {ckpt_dir} ({format_epoch_progress(epoch_progress)})",
+                )
+                wandb_logger.log_checkpoint(step, str(ckpt_dir), epoch=epoch_progress.epoch)
+            barrier()
+            denoiser.train()
 
-    if max_steps % save_every != 0 and is_main_process(rank):
-        bare_denoiser = unwrap_module(denoiser)
-        ckpt_dir = save_training_checkpoint(
-            output_dir=args.output_dir / f"step_{max_steps}",
-            denoiser=bare_denoiser.cpu(),
-            denoiser_cfg=denoiser_cfg,
-            training_cfg=OmegaConf.to_container(cfg, resolve=True),
-            stats_dir=stats_workdir,
-        )
-        bare_denoiser.to(device)
-        denoiser.train()
-        print_rank0(
-            rank,
-            f"saved final checkpoint to {ckpt_dir} "
-            f"({format_epoch_progress(StepEpochProgress.at_step(max_steps, epoch_schedule))})",
-        )
-        wandb_logger.log_checkpoint(
-            max_steps,
-            str(ckpt_dir),
-            epoch=StepEpochProgress.at_step(max_steps, epoch_schedule).epoch,
-        )
-    barrier()
+    if max_steps % save_every != 0:
+        barrier()
+        if is_main_process(rank):
+            bare_denoiser = unwrap_module(denoiser)
+            with torch.inference_mode():
+                ckpt_dir = save_training_checkpoint(
+                    output_dir=args.output_dir / f"step_{max_steps}",
+                    denoiser=bare_denoiser,
+                    denoiser_cfg=denoiser_cfg,
+                    training_cfg=OmegaConf.to_container(cfg, resolve=True),
+                    stats_dir=stats_workdir,
+                )
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            print_rank0(
+                rank,
+                f"saved final checkpoint to {ckpt_dir} "
+                f"({format_epoch_progress(StepEpochProgress.at_step(max_steps, epoch_schedule))})",
+            )
+            wandb_logger.log_checkpoint(
+                max_steps,
+                str(ckpt_dir),
+                epoch=StepEpochProgress.at_step(max_steps, epoch_schedule).epoch,
+            )
+        barrier()
 
     total_time = time.perf_counter() - start_time
     print_rank0(rank, f"Training completed in {_format_duration(total_time)}")
@@ -609,14 +693,14 @@ def main() -> int:
             print_rank0(rank, f"inference smoke ok: output shape {tuple(x.shape)}")
 
         if args.smoke:
-            ckpt_dir = save_training_checkpoint(
-                output_dir=args.output_dir / "smoke_final",
-                denoiser=bare_denoiser.cpu(),
-                denoiser_cfg=denoiser_cfg,
-                training_cfg=OmegaConf.to_container(cfg, resolve=True),
-                stats_dir=stats_workdir,
-            )
-            bare_denoiser.to(device)
+            with torch.inference_mode():
+                ckpt_dir = save_training_checkpoint(
+                    output_dir=args.output_dir / "smoke_final",
+                    denoiser=bare_denoiser,
+                    denoiser_cfg=denoiser_cfg,
+                    training_cfg=OmegaConf.to_container(cfg, resolve=True),
+                    stats_dir=stats_workdir,
+                )
             print_rank0(rank, f"saved smoke checkpoint to {ckpt_dir}")
 
     if distributed:

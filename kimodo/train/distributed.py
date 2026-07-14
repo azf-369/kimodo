@@ -33,7 +33,10 @@ def init_distributed(backend: str = "nccl") -> tuple[bool, int, int, int]:
         torch.cuda.set_device(local_rank)
 
     if not dist.is_initialized():
-        dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+        init_kwargs: dict = {"backend": backend, "rank": rank, "world_size": world_size}
+        if torch.cuda.is_available():
+            init_kwargs["device_id"] = torch.device(f"cuda:{local_rank}")
+        dist.init_process_group(**init_kwargs)
 
     return True, rank, world_size, local_rank
 
@@ -44,7 +47,11 @@ def is_main_process(rank: int = 0) -> bool:
 
 def barrier() -> None:
     if dist.is_available() and dist.is_initialized():
-        dist.barrier()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            dist.barrier(device_ids=[torch.cuda.current_device()])
+        else:
+            dist.barrier()
 
 
 def unwrap_module(module: torch.nn.Module) -> torch.nn.Module:
@@ -60,11 +67,14 @@ def wrap_distributed(
 ) -> torch.nn.Module:
     if device.type != "cuda":
         raise ValueError("DDP training requires CUDA devices.")
+    # Static buffers only (e.g. positional encodings); skip per-forward broadcast
+    # to avoid NCCL hangs if rank0 ever diverges during checkpoint I/O.
     return DDP(
         module,
         device_ids=[local_rank],
         output_device=local_rank,
         find_unused_parameters=find_unused_parameters,
+        broadcast_buffers=False,
     )
 
 

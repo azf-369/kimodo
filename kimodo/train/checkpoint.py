@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,11 @@ from typing import Any
 import torch
 from omegaconf import OmegaConf
 from safetensors.torch import save_file
+
+
+def state_dict_on_cpu(module: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """Copy weights to CPU without moving the live module off its training device."""
+    return {key: tensor.detach().cpu() for key, tensor in module.state_dict().items()}
 
 
 def _denoiser_export_config(denoiser_cfg: dict[str, Any], checkpoint_dir: Path) -> dict[str, Any]:
@@ -35,7 +41,9 @@ def save_training_checkpoint(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     model_path = output_dir / "model.safetensors"
-    save_file(denoiser.state_dict(), model_path)
+    cpu_state = state_dict_on_cpu(denoiser)
+    save_file(cpu_state, model_path)
+    del cpu_state
 
     stats_dest = output_dir / "stats" / "motion"
     stats_dest.mkdir(parents=True, exist_ok=True)
@@ -52,7 +60,13 @@ def save_training_checkpoint(
                     "Ensure checkpoints/Kimodo-G1-SEED-v1/stats/motion exists "
                     "or pass --stats-path to a valid stats directory."
                 )
-            shutil.copy2(src_file, dst / name)
+            dst_file = dst / name
+            if dst_file.exists() or dst_file.is_symlink():
+                dst_file.unlink()
+            try:
+                os.symlink(src_file.resolve(), dst_file)
+            except OSError:
+                shutil.copy2(src_file, dst_file)
 
     export_cfg = {
         "_target_": "kimodo.model.Kimodo",

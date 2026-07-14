@@ -439,6 +439,13 @@ python -m kimodo.train.scripts.precompute_text_embeddings \
   --split-path datasets/kimodo-benchmark/splits/train_split_paths.txt
 
 # 2. 4 卡训练（global batch=512，无 grad_accum；约每 25000 step / 100 epoch 存一次 ckpt）
+tmux attach -t kimodo_train_1
+source .venv/bin/activate
+export http_proxy=http://10.127.48.11:3128/
+export https_proxy=http://10.127.48.11:3128/
+export HTTP_PROXY=$http_proxy
+export HTTPS_PROXY=$https_proxy
+export WANDB_API_KEY="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"
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 torchrun --standalone --nproc_per_node=4 \
   -m kimodo.train.scripts.train_fm \
@@ -470,14 +477,20 @@ torchrun --standalone --nproc_per_node=4 \
 
 ## 本地测试：
 ```bash
-cd /home/zhengjk/PyProject/kimodo
-conda deactivate
+# cd /home/zhengjk/PyProject/kimodo
+# conda deactivate
 source .venv/bin/activate
-export TEXT_ENCODER_DEVICE=cpu
+# export TEXT_ENCODER_DEVICE=cpu
+export http_proxy=http://10.127.48.11:3128/
+export https_proxy=http://10.127.48.11:3128/
+export HTTP_PROXY=$http_proxy
+export HTTPS_PROXY=$https_proxy
 kimodo_demo \
   --model g1-seed \
-  --checkpoint outputs/fm_g1_seed_no_text_local/step_50000 \
+  --checkpoint outputs/fm_g1_seed_4gpu_1m/step_4676 \
   --examples-dir kimodo/assets/demo/examples/kimodo-g1-rp
+
+ssh -N -L 7860:localhost:7860 user@your-server
 # 浏览器打开：http://127.0.0.1:7860
 # 在 UI 中：
 # Settings → 确认是 SEED + G1 → 点 Load model
@@ -553,6 +566,7 @@ hf download bones-studio/seed \
 ```
 
 ## 需下载文件（未验证）：
+```bash
 cd /data_sjy/jf/kimodo
 source .venv/bin/activate
 
@@ -587,4 +601,60 @@ hf download bones-studio/seed \
   --repo-type dataset \
   --local-dir datasets/bones-seed \
   --include "g1.tar.gz" --include "metadata/*"
+```
+
+## 出现过的问题：
+```bash
+# 多卡分布式训练中，可能会出现DDP通信错误的问题
+# DDP (Distributed Data Parallel，分布式数据并行)：PyTorch 中用于加速模型训练的官方推荐模块。
+# NCCL (NVIDIA Collective Communication Library)：NVIDIA 开发的底层集体通信库。
+export NCCL_ASYNC_ERROR_HANDLING=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+```
+
+# 训练日志 7.13-
+```bash
+tmux attach -t kimodo_train_1
+source .venv/bin/activate
+export http_proxy=http://10.127.48.11:3128/
+export https_proxy=http://10.127.48.11:3128/
+export HTTP_PROXY=$http_proxy
+export HTTPS_PROXY=$https_proxy
+export WANDB_API_KEY="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"
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+torchrun --standalone --nproc_per_node=4 \
+  -m kimodo.train.scripts.train_fm \
+  --server --server-4gpu \
+  --text-mode encoder \
+  --data-root datasets/bones-seed \
+  --split-path datasets/kimodo-benchmark/splits/train_split_paths.txt \
+  --stats-path checkpoints/Kimodo-G1-SEED-v1/stats/motion \
+  --output-dir outputs/fm_g1_seed_4gpu_1m \
+  --device cuda \
+  --wandb --wandb-run-name g1-text-4gpu-1m
+
+# 训练到3340步出现loss异常波动，重启续训练
+tmux attach -t kimodo_train_1   # 进去 Ctrl-C 停掉当前训练，或 kill 掉进程
+
+source .venv/bin/activate
+export http_proxy=http://10.127.48.11:3128/
+export https_proxy=http://10.127.48.11:3128/
+export HTTP_PROXY=$http_proxy
+export HTTPS_PROXY=$https_proxy
+export WANDB_API_KEY="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"
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+export NCCL_ASYNC_ERROR_HANDLING=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+torchrun --standalone --nproc_per_node=4 \
+  -m kimodo.train.scripts.train_fm \
+  --server --server-4gpu \
+  --text-mode encoder \
+  --data-root datasets/bones-seed \
+  --split-path datasets/kimodo-benchmark/splits/train_split_paths.txt \
+  --stats-path checkpoints/Kimodo-G1-SEED-v1/stats/motion \
+  --output-dir outputs/fm_g1_seed_4gpu_1m \
+  --resume-from outputs/fm_g1_seed_4gpu_1m/step_3340 \
+  --device cuda \
+  --wandb --wandb-run-name g1-text-4gpu-1m-resume3340
 ```

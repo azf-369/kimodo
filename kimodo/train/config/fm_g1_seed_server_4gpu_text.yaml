@@ -1,6 +1,12 @@
 # Text-conditioned 4-GPU overrides (precomputed LLM2Vec cache; no GPU text encoder in loop).
 training:
-  lr: 8.0e-4
+  # Lowered from 7e-4: at 7e-4 a single hard batch (grad_norm ~7.7 at step 3550)
+  # pushed weights into a high-loss flat region that small gradients could not escape.
+  lr: 3.0e-4
+  # Tighter clip to suppress rare gradient spikes that destabilize training.
+  grad_clip: 0.5
+  # warmup_steps inherited from fm_g1_seed_server_text.yaml (5000): when resuming
+  # from step_3340 the LambdaLR replay yields ~2e-4 start, ramping back to 3e-4.
 
 text_cache:
   enabled: true

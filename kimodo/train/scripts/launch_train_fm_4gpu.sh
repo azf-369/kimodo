@@ -9,6 +9,11 @@
 # Official-aligned run: max_steps=1_000_000 (~3-5 days on 4xH100).
 set -euo pipefail
 
+# NCCL / CUDA stability (avoid silent collective hangs after checkpoint save).
+export NCCL_ASYNC_ERROR_HANDLING="${NCCL_ASYNC_ERROR_HANDLING:-1}"
+export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
 NPROC="${NPROC:-4}"
 EXTRA_ARGS=("$@")
 
