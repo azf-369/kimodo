@@ -81,15 +81,12 @@ def precompute_text_embeddings(
     device: torch.device,
     skip_existing: bool = True,
 ) -> int:
-    """Encode all training prompts once and store them on disk."""
+    """Encode training prompts once and store them on disk.
+
+    Identical prompt strings are encoded only once, then written to every
+    matching ``rel_path`` cache file (SEED has high text duplication).
+    """
     cache_dir.mkdir(parents=True, exist_ok=True)
-    provider = TextEmbeddingProvider(
-        num_tokens=num_tokens,
-        llm_dim=llm_dim,
-        device=device,
-        mode="encoder",
-        encoder_cfg=encoder_cfg,
-    )
 
     to_compute: list[dict] = []
     for sample in samples:
@@ -101,17 +98,41 @@ def precompute_text_embeddings(
     if not to_compute:
         return 0
 
-    for sample in tqdm(to_compute, desc="Precomputing text embeddings", unit="clip"):
-        text_feat, text_pad_mask = provider.encode([sample["text"]])
-        save_text_embedding(
-            cache_path_for_rel_path(cache_dir, sample["rel_path"]),
-            text_feat=text_feat[0],
-            text_pad_mask=text_pad_mask[0],
-            text=sample["text"],
-            rel_path=sample["rel_path"],
-        )
+    # Group by exact text string — official LLM2Vec path is deterministic per string.
+    text_to_samples: dict[str, list[dict]] = {}
+    for sample in to_compute:
+        text_to_samples.setdefault(sample["text"], []).append(sample)
 
-    return len(to_compute)
+    print(
+        f"Text cache: {len(to_compute)} missing files → "
+        f"{len(text_to_samples)} unique prompts to encode "
+        f"(dedupe saves ~{100.0 * (1 - len(text_to_samples) / max(1, len(to_compute))):.1f}%)."
+    )
+
+    provider = TextEmbeddingProvider(
+        num_tokens=num_tokens,
+        llm_dim=llm_dim,
+        device=device,
+        mode="encoder",
+        encoder_cfg=encoder_cfg,
+    )
+
+    written = 0
+    for text, group in tqdm(text_to_samples.items(), desc="Precomputing text embeddings", unit="prompt"):
+        text_feat, text_pad_mask = provider.encode([text])
+        feat0 = text_feat[0]
+        mask0 = text_pad_mask[0]
+        for sample in group:
+            save_text_embedding(
+                cache_path_for_rel_path(cache_dir, sample["rel_path"]),
+                text_feat=feat0,
+                text_pad_mask=mask0,
+                text=sample["text"],
+                rel_path=sample["rel_path"],
+            )
+            written += 1
+
+    return written
 
 
 def resolve_text_cache_dir(cfg, cli_cache_dir: Optional[Path]) -> Optional[Path]:

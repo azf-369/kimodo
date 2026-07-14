@@ -15,6 +15,9 @@ git config user.email "azf-157@sjtu.edu.cn"
 
 # 关闭密码拦截
 unset GIT_ASKPASS
+
+# 安装opencode：
+curl -fsSL https://opencode.ai/install | bash
 ```
 
 ## 环境安装：
@@ -658,3 +661,15 @@ torchrun --standalone --nproc_per_node=4 \
   --device cuda \
   --wandb --wandb-run-name g1-text-4gpu-1m-resume3340
 ```
+
+第一阶段总结：
+参与 Teleai 具身智能研发部门关于 WAM 方向的科研开发工作
+
+
+
+
+
+
+
+
+首先为了弥补我在 WAM 方向知识储备上的一些 gap，更好地参与到 WAM 方向的科研工作中，我按照企业 mentor 的建议梳理具身智能领域的技术发展史，并重点调研了近期在 WAM 技术领域取得重大突破的相关研究如 Fast-WAM、Lingbot-va 等工作，

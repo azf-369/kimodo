@@ -1,0 +1,45 @@
+# Formal local training on RTX 4080 SUPER 16GB (proven max_frames=64).
+# Merge with: --local --formal
+#
+# Prerequisites:
+#   1) Empty GPU (no demo / other jobs)
+#   2) Full text cache for the train split (not just --max-files 128)
+#      python -m kimodo.distill.scripts.train_pd --local --precompute-text-only ...
+#
+# Effective batch ≈ batch_size * grad_accum = 8
+
+training:
+  max_frames: 64
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  num_workers: 2
+  # Distillation LR: lower than scratch FM (1e-4); student starts from teacher.
+  lr: 5.0e-5
+  lr_schedule: cosine
+  min_lr_ratio: 0.1
+  warmup_steps: 500
+  weight_decay: 0.0
+  # Stage 100→50 formal budget on one 4080 (adjust if needed).
+  max_steps: 30000
+  grad_clip: 1.0
+  log_every: 20
+  save_every: 2500
+  # Full teacher-aligned conditioning
+  constraint_prob: 0.8
+  max_keyframes: 4
+  cfg_dropout:
+    uncond: 0.1
+    text_only: 0.1
+    constraint_only: 0.1
+
+distill:
+  teacher_steps: 100
+  student_steps: 50
+  init_student_from_teacher: true
+  amp: true
+  amp_dtype: bfloat16
+
+text_cache:
+  enabled: true
+  dir: datasets/bones-seed/cache/llm2vec_g1_train
+  auto_precompute: false

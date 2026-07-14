@@ -1,0 +1,33 @@
+# Tiny models for CPU/GPU smoke tests (not for quality).
+training:
+  max_frames: 32
+  batch_size: 2
+  gradient_accumulation_steps: 1
+  num_workers: 0
+  max_steps: 4
+  warmup_steps: 0
+  log_every: 1
+  save_every: 1000000
+  constraint_prob: 0.0
+  lr: 1.0e-4
+  cfg_dropout:
+    uncond: 0.0
+    text_only: 0.0
+    constraint_only: 0.0
+
+distill:
+  teacher_steps: 8
+  student_steps: 4
+  init_student_from_teacher: true
+  amp: false
+
+denoiser:
+  latent_dim: 128
+  ff_size: 256
+  num_layers: 2
+  num_heads: 4
+  num_text_tokens_override: 0
+  input_first_heading_angle: false
+
+text_cache:
+  enabled: false

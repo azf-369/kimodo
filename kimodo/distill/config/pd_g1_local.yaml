@@ -1,0 +1,18 @@
+# Local overrides; prefer --local --formal for production Stage1 on 16GB.
+training:
+  max_frames: 64
+  batch_size: 1
+  gradient_accumulation_steps: 4
+  num_workers: 0
+  max_steps: 5000
+  log_every: 10
+  save_every: 1000
+
+distill:
+  amp: true
+  amp_dtype: bfloat16
+
+text_cache:
+  enabled: true
+  dir: datasets/bones-seed/cache/llm2vec_g1_train
+  auto_precompute: false

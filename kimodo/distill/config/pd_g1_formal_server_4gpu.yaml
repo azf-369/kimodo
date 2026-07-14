@@ -1,0 +1,50 @@
+# 4x H100 80GB DDP overrides for PD Stage1.
+# Use with: torchrun --standalone --nproc_per_node=4 -m kimodo.distill.scripts.train_pd \
+#            --server --server-4gpu ...
+#
+# Per-GPU batch 8 → global batch = 8 × 4 = 32.
+# Local formal reference: effective batch 8 @ lr 5e-5
+#   sqrt LR scale: 5e-5 * sqrt(32/8) ≈ 1e-4
+
+training:
+  max_frames: 300
+  batch_size: 8
+  gradient_accumulation_steps: 1
+  num_workers: 8
+  lr: 1.0e-4
+  lr_schedule: cosine
+  min_lr_ratio: 0.1
+  warmup_steps: 2000
+  weight_decay: 0.0
+  max_steps: 30000
+  grad_clip: 1.0
+  log_every: 20
+  save_every: 2500
+  constraint_prob: 0.8
+  max_keyframes: 4
+  cfg_dropout:
+    uncond: 0.1
+    text_only: 0.1
+    constraint_only: 0.1
+
+dataloader:
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 8
+
+distill:
+  teacher_steps: 100
+  student_steps: 50
+  init_student_from_teacher: true
+  amp: true
+  amp_dtype: bfloat16
+
+text_encoder:
+  dtype: float32
+  device: auto
+
+text_cache:
+  enabled: true
+  dir: datasets/bones-seed/cache/llm2vec_g1_train
+  # Rank 0 builds the cache; other ranks wait on a barrier.
+  auto_precompute: true

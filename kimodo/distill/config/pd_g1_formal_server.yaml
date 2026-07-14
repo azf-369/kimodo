@@ -1,0 +1,53 @@
+# Formal Stage1 Progressive Distillation on a single NVIDIA H100 80GB.
+# Merge with: --server  (or --server --formal)
+#
+# VRAM headroom is large vs 4080 16GB:
+#   - longer clips (max_frames=300)
+#   - larger per-GPU batch (no need for heavy grad_accum)
+#   - CUDA text-cache precompute (auto_precompute); do NOT force CPU
+#
+# Effective batch = batch_size * grad_accum = 8 (same as local formal 1×8).
+# Distill LR stays modest because student is initialized from teacher.
+
+training:
+  max_frames: 300
+  batch_size: 8
+  gradient_accumulation_steps: 1
+  num_workers: 12
+  lr: 5.0e-5
+  lr_schedule: cosine
+  min_lr_ratio: 0.1
+  warmup_steps: 1000
+  weight_decay: 0.0
+  max_steps: 30000
+  grad_clip: 1.0
+  log_every: 20
+  save_every: 2500
+  constraint_prob: 0.8
+  max_keyframes: 4
+  cfg_dropout:
+    uncond: 0.1
+    text_only: 0.1
+    constraint_only: 0.1
+
+dataloader:
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 4
+
+distill:
+  teacher_steps: 100
+  student_steps: 50
+  init_student_from_teacher: true
+  amp: true
+  amp_dtype: bfloat16
+
+text_encoder:
+  # Used only while building the LLM2Vec cache (not during PD loop if cache hits).
+  dtype: float32
+  device: auto
+
+text_cache:
+  enabled: true
+  dir: datasets/bones-seed/cache/llm2vec_g1_train
+  auto_precompute: true
