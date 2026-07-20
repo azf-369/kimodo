@@ -1,0 +1,81 @@
+# Stage-3 Progressive Distillation (24→12) — gentle finetune, local 16GB.
+#
+# Continues from Stage-2 student (25-step) checkpoint chosen as best:
+#   outputs/pd_g1_rp_teacher_seed/stage_50to25_best/step_10000
+#
+# Why 24→12 (not 25→12.5)?
+#   PD requires even teacher_steps (two DDIM jumps). STAGE_SCHEDULE uses
+#   (24, 12) after (50, 25). Frozen Stage-2 weights are still the teacher;
+#   only the subsampled DDIM grid is 24 steps (≈25).
+#
+# Relative to Stage-2 gentle: even lower LR / shorter budget / stronger
+# teacher anchors — each jump covers a larger noise gap at this NFE.
+#
+# Train:
+#   STAGE2=outputs/pd_g1_rp_teacher_seed/stage_50to25_best/step_10000
+#   python -m kimodo.distill.scripts.train_pd \
+#     --local --recipe pd_g1_stage3_24to12_gentle_local --stage 24to12 \
+#     --teacher-checkpoint "$STAGE2" --teacher-dtype fp32 \
+#     --data-root datasets/bones-seed \
+#     --split-path datasets/kimodo-benchmark/splits/train_split_paths.txt \
+#     --stats-path checkpoints/Kimodo-G1-SEED-v1.hf/stats/motion \
+#     --output-dir outputs/pd_g1_rp_teacher_seed/stage_24to12_gentle \
+#     --device cuda --wandb --wandb-project kimodo-pd-g1 \
+#     --wandb-run-name pd-24to12-gentle
+#
+# Eval @12 often; fair baseline = Stage2 step_10000 @ --steps 12
+#   (see outputs/pd_eval/step_10000_vs_rp_s12). Pick best by sweep, not last step.
+
+training:
+  max_frames: 300
+  frame_crop: random
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  num_workers: 2
+  lr: 1.0e-6
+  lr_schedule: cosine
+  min_lr_ratio: 0.25
+  warmup_steps: 300
+  weight_decay: 0.0
+  max_steps: 8000
+  grad_clip: 1.0
+  log_every: 20
+  save_every: 1000
+  constraint_prob: 1.0
+  max_keyframes: 6
+  constraint_mix:
+    fullbody: 1.0
+  cfg_dropout:
+    uncond: 0.05
+    text_only: 0.05
+    # Softer than Stage-2 0.15: 12-NFE needs more text/dynamics.
+    constraint_only: 0.10
+
+distill:
+  teacher_steps: 24
+  student_steps: 12
+  init_student_from_teacher: true
+  amp: true
+  amp_dtype: bfloat16
+  pd_match_space: x0
+  snr_gamma: 5.0
+  pd_jump_weight: 1.0
+  diffuse_anchor_weight: 0.15
+  teacher_x0_weight: 0.6
+  constraint_anchor_weight: 0.75
+  root_xz_weight: 0.0
+  ee_pos_weight: 0.0
+  contact_weight: 0.0
+  skate_weight: 0.0
+  save_step0: true
+
+text_cache:
+  enabled: true
+  dir: datasets/bones-seed/cache/llm2vec_g1_train
+  auto_precompute: false
+
+_stage_meta:
+  stage: 24to12
+  parent_recipe: pd_g1_stage2_50to25_gentle_local
+  parent_checkpoint: outputs/pd_g1_rp_teacher_seed/stage_50to25_best/step_10000
+  note: even gentler than Stage-2; teacher schedule 24≈Stage-2 25-NFE model

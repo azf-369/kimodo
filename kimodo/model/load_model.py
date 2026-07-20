@@ -65,6 +65,16 @@ def _build_api_text_encoder_conf(text_encoder_url: str) -> dict:
     }
 
 
+def _resolve_hf_snapshot_path(repo_id: str) -> str:
+    """Map a Hugging Face repo id to a local cache snapshot when available."""
+    if Path(repo_id).exists():
+        return str(Path(repo_id).resolve())
+    try:
+        return str(snapshot_download(repo_id=repo_id, local_files_only=True))
+    except Exception:
+        return repo_id
+
+
 def _build_local_text_encoder_conf(text_encoder_fp32: bool = False) -> dict:
     text_encoder_name = get_env_var("TEXT_ENCODER", DEFAULT_TEXT_ENCODER)
     if text_encoder_name not in TEXT_ENCODER_PRESETS:
@@ -72,11 +82,14 @@ def _build_local_text_encoder_conf(text_encoder_fp32: bool = False) -> dict:
         raise ValueError(f"Unknown TEXT_ENCODER='{text_encoder_name}'. Available: {available}")
 
     preset = TEXT_ENCODER_PRESETS[text_encoder_name]
+    kwargs = dict(preset["kwargs"])
     if text_encoder_fp32:
-        preset["kwargs"]["dtype"] = "float32"
+        kwargs["dtype"] = "float32"
+    kwargs["base_model_name_or_path"] = _resolve_hf_snapshot_path(kwargs["base_model_name_or_path"])
+    kwargs["peft_model_name_or_path"] = _resolve_hf_snapshot_path(kwargs["peft_model_name_or_path"])
     return {
         "_target_": preset["target"],
-        **preset["kwargs"],
+        **kwargs,
     }
 
 
@@ -221,6 +234,8 @@ def load_model(
 
     model_cfg = OmegaConf.to_container(OmegaConf.merge(model_conf, runtime_conf), resolve=True)
     model_cfg.pop("checkpoint_dir", None)
+    # PD exports stash this for inference UI hints; Kimodo.__init__ does not accept it.
+    model_cfg.pop("recommended_diffusion_steps", None)
 
     if text_encoder is not None:
         # Prevent Hydra from instantiating a new text encoder; pass None so

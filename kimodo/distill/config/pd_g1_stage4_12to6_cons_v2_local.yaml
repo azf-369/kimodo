@@ -1,0 +1,92 @@
+# Stage-4 Progressive Distillation (12→6) — cons_v2 full retrain (cold start).
+#
+# Full Stage-4 restart from Stage-3 teacher (NOT resume from cons/step_4000).
+# Student init = copy of frozen Stage-3 weights (init_student_from_teacher).
+#
+# Why vs prior cons:
+#   cons plateaued ~4k (root≈0.11, EE≈0.19). Same recipe + longer steps failed.
+#   v2 keeps EE/root-heavy mix + stronger channel losses, but cold-starts so
+#   the whole 12→6 PD jump is learned under the new objective (no resume bias).
+#
+# Backups (do not delete / overwrite):
+#   pd_g1_stage4_12to6_gentle_local.yaml → stage_12to6_gentle
+#   pd_g1_stage4_12to6_cons_local.yaml   → stage_12to6_cons
+#
+# Teacher:
+#   outputs/pd_g1_rp_teacher_seed/stage_24to12_best/step_8000
+#
+# Train (cold start — no --resume-student-from):
+#   STAGE3=outputs/pd_g1_rp_teacher_seed/stage_24to12_best/step_8000
+#   python -m kimodo.distill.scripts.train_pd \
+#     --local --recipe pd_g1_stage4_12to6_cons_v2_local --stage 12to6 \
+#     --teacher-checkpoint "$STAGE3" --teacher-dtype fp32 \
+#     --data-root datasets/bones-seed \
+#     --split-path datasets/kimodo-benchmark/splits/train_split_paths.txt \
+#     --stats-path checkpoints/Kimodo-G1-SEED-v1.hf/stats/motion \
+#     --output-dir outputs/pd_g1_rp_teacher_seed/stage_12to6_cons_v2 \
+#     --device cuda --wandb --wandb-project kimodo-pd-g1 \
+#     --wandb-run-name pd-12to6-cons-v2
+#
+# Eval @6 every 1k; target root/EE/fullbody err < 0.1.
+# Compare to stage_12to6_cons/step_4000 @6 (prior best).
+
+training:
+  max_frames: 300
+  frame_crop: random
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  num_workers: 2
+  # Slightly above resume-v2 lr: cold start needs more movement early;
+  # still below cons 1.5e-6 to limit late oscillation.
+  lr: 1.2e-6
+  lr_schedule: cosine
+  min_lr_ratio: 0.2
+  warmup_steps: 500
+  weight_decay: 0.0
+  max_steps: 6000
+  grad_clip: 1.0
+  log_every: 20
+  save_every: 1000
+  constraint_prob: 1.0
+  max_keyframes: 10
+  constraint_mix:
+    fullbody: 0.10
+    root2d: 0.25
+    ee_hands: 0.40
+    ee_feet: 0.25
+  cfg_dropout:
+    uncond: 0.05
+    text_only: 0.05
+    constraint_only: 0.28
+
+distill:
+  teacher_steps: 12
+  student_steps: 6
+  init_student_from_teacher: true
+  amp: true
+  amp_dtype: bfloat16
+  pd_match_space: x0
+  snr_gamma: 5.0
+  pd_jump_weight: 1.0
+  diffuse_anchor_weight: 0.15
+  teacher_x0_weight: 0.30
+  constraint_anchor_weight: 3.5
+  root_xz_weight: 2.0
+  ee_pos_weight: 4.0
+  contact_weight: 0.0
+  skate_weight: 0.0
+  save_step0: true
+
+text_cache:
+  enabled: true
+  dir: datasets/bones-seed/cache/llm2vec_g1_train
+  auto_precompute: false
+
+_stage_meta:
+  stage: 12to6
+  parent_recipe: pd_g1_stage3_24to12_gentle_local
+  parent_checkpoint: outputs/pd_g1_rp_teacher_seed/stage_24to12_best/step_8000
+  prior_stage4_recipes:
+    - pd_g1_stage4_12to6_gentle_local
+    - pd_g1_stage4_12to6_cons_local
+  note: cold-start Stage-4 retrain; EE/root-heavy; no resume from cons

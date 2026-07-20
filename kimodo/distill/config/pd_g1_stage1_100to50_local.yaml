@@ -1,0 +1,71 @@
+# Stage-1 Progressive Distillation (100→50) — local 16GB archive.
+#
+# Exact recipe from wandb run pd-100to50-formal-cons-v4, which produced
+# outputs/pd_g1_rp_teacher_seed/stage_100to50_best (alias of formal_cons).
+#
+# Reproduce Stage-1 (optional):
+#   python -m kimodo.distill.scripts.train_pd \
+#     --local --recipe pd_g1_stage1_100to50_local --stage 100to50 \
+#     --teacher-checkpoint "$RP" --teacher-dtype fp32 \
+#     --data-root datasets/bones-seed \
+#     --split-path datasets/kimodo-benchmark/splits/train_split_paths.txt \
+#     --stats-path checkpoints/Kimodo-G1-SEED-v1.hf/stats/motion \
+#     --output-dir outputs/pd_g1_rp_teacher_seed/stage_100to50_rerun \
+#     --device cuda --wandb --wandb-project kimodo-pd-g1
+#
+# Do not edit casually — Stage-2 builds on this checkpoint / recipe.
+
+training:
+  max_frames: 300
+  frame_crop: random
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  num_workers: 2
+  lr: 5.0e-6
+  lr_schedule: cosine
+  min_lr_ratio: 0.1
+  warmup_steps: 2000
+  weight_decay: 0.0
+  max_steps: 30000
+  grad_clip: 1.0
+  log_every: 20
+  save_every: 1000
+  constraint_prob: 1.0
+  max_keyframes: 6
+  # FullBody-only → Stage-1 formal_cons sampling path in constraint_synth.py
+  constraint_mix:
+    fullbody: 1.0
+  cfg_dropout:
+    uncond: 0.05
+    text_only: 0.05
+    constraint_only: 0.25
+
+distill:
+  teacher_steps: 100
+  student_steps: 50
+  init_student_from_teacher: true
+  amp: true
+  amp_dtype: bfloat16
+  pd_match_space: x0
+  snr_gamma: 5.0
+  pd_jump_weight: 1.0
+  diffuse_anchor_weight: 0.5
+  teacher_x0_weight: 0.2
+  constraint_anchor_weight: 2.0
+  root_xz_weight: 0.0
+  ee_pos_weight: 0.0
+  contact_weight: 0.0
+  skate_weight: 0.0
+  save_step0: true
+
+text_cache:
+  enabled: true
+  dir: datasets/bones-seed/cache/llm2vec_g1_train
+  auto_precompute: false
+
+# Provenance (for reproduction)
+_stage_meta:
+  stage: 100to50
+  source_run: pd-100to50-formal-cons-v4
+  source_output: outputs/pd_g1_rp_teacher_seed/stage_100to50_best
+  teacher_was: official Kimodo-G1-RP-v1

@@ -99,8 +99,10 @@ class TwostageDenoiser(nn.Module):
             if motion_mask is None or observed_motion is None:
                 motion_mask = torch.zeros_like(x)
                 observed_motion = torch.zeros_like(x)
-            x = x * (1 - motion_mask) + observed_motion * motion_mask
-            x_extended = torch.cat([x, motion_mask], axis=-1)
+            mask = motion_mask.to(dtype=x.dtype)
+            observed = observed_motion.to(dtype=x.dtype)
+            x = x * (1 - mask) + observed * mask
+            x_extended = torch.cat([x, mask], axis=-1)
         else:
             x_extended = x
 

@@ -17,6 +17,10 @@ def build_condition_dicts(constraints_lst: list):
 
 def get_unique_index_and_data(indices_lst, data):
     # unique + sort them by t
+    # Indices may already be on the output device while constraint payloads are still on CPU
+    # (training synth builds constraint objects on CPU, then materializes masks on CUDA).
+    if data.device != indices_lst.device:
+        data = data.to(device=indices_lst.device)
     indices_unique, inverse = torch.unique(indices_lst, dim=0, return_inverse=True)
     # pick first value for each unique (t, j)
     first_idx = torch.zeros(indices_unique.size(0), dtype=torch.long, device=inverse.device)

@@ -1,0 +1,81 @@
+# Stage-4 Progressive Distillation (12→6) — gentle finetune, local 16GB.
+#
+# BACKUP / archived recipe. Prefer constraint-first retrain:
+#   pd_g1_stage4_12to6_cons_local.yaml  →  stage_12to6_cons
+# Gentle @6: fullbody≈0.07 OK, but root≈0.25 / EE≈0.48 (need <0.1).
+#
+# Continues from Stage-3 student (12-step) checkpoint chosen as best:
+#   outputs/pd_g1_rp_teacher_seed/stage_24to12_best/step_8000
+#
+# Aligns with STAGE_SCHEDULE (12, 6) after (24, 12). Jump gap is large at
+# this NFE — keep LR / constraint pressure lower than Stage-3; lean harder on
+# teacher_x0 so the frozen 12-step teacher is not overwritten.
+#
+# Train:
+#   STAGE3=outputs/pd_g1_rp_teacher_seed/stage_24to12_best/step_8000
+#   python -m kimodo.distill.scripts.train_pd \
+#     --local --recipe pd_g1_stage4_12to6_gentle_local --stage 12to6 \
+#     --teacher-checkpoint "$STAGE3" --teacher-dtype fp32 \
+#     --data-root datasets/bones-seed \
+#     --split-path datasets/kimodo-benchmark/splits/train_split_paths.txt \
+#     --stats-path checkpoints/Kimodo-G1-SEED-v1.hf/stats/motion \
+#     --output-dir outputs/pd_g1_rp_teacher_seed/stage_12to6_gentle \
+#     --device cuda --wandb --wandb-project kimodo-pd-g1 \
+#     --wandb-run-name pd-12to6-gentle
+#
+# Eval @6 often; fair baseline = Stage-3 step_8000 @ --steps 6.
+# Pick best via eval_pd_run, not the last step.
+
+training:
+  max_frames: 300
+  frame_crop: random
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  num_workers: 2
+  lr: 7.5e-7
+  lr_schedule: cosine
+  min_lr_ratio: 0.3
+  warmup_steps: 200
+  weight_decay: 0.0
+  max_steps: 6000
+  grad_clip: 1.0
+  log_every: 20
+  save_every: 1000
+  constraint_prob: 1.0
+  max_keyframes: 6
+  constraint_mix:
+    fullbody: 1.0
+  cfg_dropout:
+    uncond: 0.05
+    text_only: 0.05
+    # Softer than Stage-3 0.10: 6-NFE needs more text/dynamics signal.
+    constraint_only: 0.08
+
+distill:
+  teacher_steps: 12
+  student_steps: 6
+  init_student_from_teacher: true
+  amp: true
+  amp_dtype: bfloat16
+  pd_match_space: x0
+  snr_gamma: 5.0
+  pd_jump_weight: 1.0
+  diffuse_anchor_weight: 0.10
+  teacher_x0_weight: 0.7
+  constraint_anchor_weight: 0.5
+  root_xz_weight: 0.0
+  ee_pos_weight: 0.0
+  contact_weight: 0.0
+  skate_weight: 0.0
+  save_step0: true
+
+text_cache:
+  enabled: true
+  dir: datasets/bones-seed/cache/llm2vec_g1_train
+  auto_precompute: false
+
+_stage_meta:
+  stage: 12to6
+  parent_recipe: pd_g1_stage3_24to12_gentle_local
+  parent_checkpoint: outputs/pd_g1_rp_teacher_seed/stage_24to12_best/step_8000
+  note: gentler than Stage-3; large jump gap at 6-NFE

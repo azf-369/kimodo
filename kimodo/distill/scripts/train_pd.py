@@ -8,6 +8,7 @@ Default setup:
   - Data: BONES-SEED G1 CSV + text (LLM2Vec cache preferred)
   - Student init: copy of teacher weights
   - Conditions: text + synthetic constraints + CFG dropout (aligned with official recipe)
+  - Stable loss (v2): x0-space PD match + Min-SNR + GT/teacher x0 anchors; formal lr=1e-5
 
 Local 16GB (Stage 100→50):
   python -m kimodo.distill.scripts.train_pd --local --formal --stage 100to50 ...
@@ -80,6 +81,14 @@ def _format_duration(seconds: float) -> str:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Progressive distillation for Kimodo-G1 diffusion.")
     parser.add_argument("--config", type=str, default="pd_g1_rp_teacher")
+    parser.add_argument(
+        "--recipe",
+        type=str,
+        default=None,
+        help="Named training recipe overlay under kimodo/distill/config/ "
+        "(e.g. pd_g1_stage1_100to50_local, pd_g1_stage2_50to25_local). "
+        "Merged after --local; replaces --formal when set.",
+    )
     parser.add_argument("--smoke", action="store_true", help="Tiny model + few steps.")
     parser.add_argument("--local", action="store_true", help="Merge pd_g1_local.yaml.")
     parser.add_argument(
@@ -128,6 +137,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument(
+        "--frame-crop",
+        type=str,
+        default=None,
+        choices=["random", "prefix"],
+        help="Clip windowing: random (teacher-aligned) or prefix. Default from config.",
+    )
+    parser.add_argument(
         "--no-text",
         action="store_true",
         help="Ablation: zero text embeddings (keeps 50-token architecture).",
@@ -169,6 +185,59 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help="Override training.constraint_prob (default 0.8 from config).",
+    )
+    parser.add_argument(
+        "--pd-match-space",
+        type=str,
+        default=None,
+        choices=["x0", "xt"],
+        help="PD match in inverted-x0 space (stable) or raw x_{t-2} (legacy).",
+    )
+    parser.add_argument(
+        "--snr-gamma",
+        type=float,
+        default=None,
+        help="Min-SNR-γ; <=0 disables. Default from config (5).",
+    )
+    parser.add_argument(
+        "--pd-jump-weight",
+        type=float,
+        default=None,
+        help="Weight on PD jump-match term.",
+    )
+    parser.add_argument(
+        "--diffuse-anchor-weight",
+        type=float,
+        default=None,
+        help="Weight on GT x0 diffusion anchor (keeps pretrained sampling alive).",
+    )
+    parser.add_argument(
+        "--teacher-x0-weight",
+        type=float,
+        default=None,
+        help="Weight on soft MSE(student_x0, teacher_x0@t).",
+    )
+    parser.add_argument(
+        "--constraint-anchor-weight",
+        type=float,
+        default=None,
+        help="Weight on MSE(student_x0, observed) over motion_mask (constraint follow).",
+    )
+    parser.add_argument(
+        "--max-keyframes",
+        type=int,
+        default=None,
+        help="Override training.max_keyframes for synthetic constraints.",
+    )
+    parser.add_argument(
+        "--save-step0",
+        action="store_true",
+        help="Save step_0 (pure init copy) before training for travel regression.",
+    )
+    parser.add_argument(
+        "--no-save-step0",
+        action="store_true",
+        help="Skip step_0 export even if config distill.save_step0 is true.",
     )
     parser.add_argument(
         "--teacher-dtype",
@@ -236,6 +305,51 @@ def _build_pd_dataloader(
     return DataLoader(dataset, **loader_kwargs), sampler
 
 
+def _export_student_checkpoint(
+    *,
+    ckpt_dir: Path,
+    bare_student,
+    cfg,
+    stats_path: Path,
+    teacher_steps: int,
+    student_steps: int,
+    student_init_desc: str,
+    export_cfg_type: str,
+) -> None:
+    training_export = {
+        "generative_paradigm": "diffusion",
+        "num_base_steps": int(cfg.num_base_steps),
+        "cfg_type": export_cfg_type,
+        "distill": {
+            "teacher_steps": teacher_steps,
+            "student_steps": student_steps,
+            "recommended_diffusion_steps": student_steps,
+            "student_init": student_init_desc,
+            "pd_match_space": str(cfg.distill.get("pd_match_space", "x0")),
+            "snr_gamma": float(cfg.distill.get("snr_gamma", 5.0)),
+            "pd_jump_weight": float(cfg.distill.get("pd_jump_weight", 1.0)),
+            "diffuse_anchor_weight": float(cfg.distill.get("diffuse_anchor_weight", 0.25)),
+            "teacher_x0_weight": float(cfg.distill.get("teacher_x0_weight", 0.1)),
+            "constraint_anchor_weight": float(cfg.distill.get("constraint_anchor_weight", 0.0)),
+            "root_xz_weight": float(cfg.distill.get("root_xz_weight", 0.0)),
+            "ee_pos_weight": float(cfg.distill.get("ee_pos_weight", 0.0)),
+            "contact_weight": float(cfg.distill.get("contact_weight", 0.0)),
+            "skate_weight": float(cfg.distill.get("skate_weight", 0.0)),
+        },
+    }
+    save_training_checkpoint(
+        output_dir=ckpt_dir,
+        denoiser=bare_student,
+        denoiser_cfg=OmegaConf.to_container(cfg.denoiser, resolve=True),
+        training_cfg=training_export,
+        stats_dir=stats_path,
+    )
+    export_cfg_path = ckpt_dir / "config.yaml"
+    export_cfg = OmegaConf.load(export_cfg_path)
+    export_cfg.recommended_diffusion_steps = student_steps
+    OmegaConf.save(export_cfg, export_cfg_path)
+
+
 def main() -> int:
     args = parse_args()
     distributed, rank, world_size, local_rank = init_distributed()
@@ -260,7 +374,9 @@ def main() -> int:
         args.text_mode = "dummy"
     if args.local:
         cfg = OmegaConf.merge(cfg, load_distill_config("pd_g1_local"))
-    if args.formal and not args.server:
+    if args.recipe:
+        cfg = OmegaConf.merge(cfg, load_distill_config(args.recipe))
+    elif args.formal and not args.server:
         # Local formal recipe (16GB). On H100, --server already loads formal_server.
         cfg = OmegaConf.merge(cfg, load_distill_config("pd_g1_formal_local"))
     if args.server:
@@ -274,6 +390,8 @@ def main() -> int:
         cfg.training.gradient_accumulation_steps = args.grad_accum_steps
     if args.max_frames is not None:
         cfg.training.max_frames = args.max_frames
+    if args.frame_crop is not None:
+        cfg.training.frame_crop = args.frame_crop
     if args.max_steps is not None:
         cfg.training.max_steps = args.max_steps
     if args.num_workers is not None:
@@ -282,6 +400,20 @@ def main() -> int:
         cfg.training.lr = args.lr
     if args.constraint_prob is not None:
         cfg.training.constraint_prob = args.constraint_prob
+    if args.pd_match_space is not None:
+        cfg.distill.pd_match_space = args.pd_match_space
+    if args.snr_gamma is not None:
+        cfg.distill.snr_gamma = args.snr_gamma
+    if args.pd_jump_weight is not None:
+        cfg.distill.pd_jump_weight = args.pd_jump_weight
+    if args.diffuse_anchor_weight is not None:
+        cfg.distill.diffuse_anchor_weight = args.diffuse_anchor_weight
+    if args.teacher_x0_weight is not None:
+        cfg.distill.teacher_x0_weight = args.teacher_x0_weight
+    if args.constraint_anchor_weight is not None:
+        cfg.distill.constraint_anchor_weight = args.constraint_anchor_weight
+    if args.max_keyframes is not None:
+        cfg.training.max_keyframes = args.max_keyframes
 
     if args.no_text:
         args.text_mode = "dummy"
@@ -338,14 +470,40 @@ def main() -> int:
     batch_size = int(train_cfg.batch_size)
     effective_global = global_batch_size(batch_size, world_size, grad_accum)
 
+    pd_match_space = str(distill_cfg.get("pd_match_space", "x0"))
+    snr_gamma = float(distill_cfg.get("snr_gamma", 5.0))
+    pd_jump_weight = float(distill_cfg.get("pd_jump_weight", 1.0))
+    diffuse_anchor_weight = float(distill_cfg.get("diffuse_anchor_weight", 0.25))
+    teacher_x0_weight = float(distill_cfg.get("teacher_x0_weight", 0.1))
+    constraint_anchor_weight = float(distill_cfg.get("constraint_anchor_weight", 0.0))
+    root_xz_weight = float(distill_cfg.get("root_xz_weight", 0.0))
+    ee_pos_weight = float(distill_cfg.get("ee_pos_weight", 0.0))
+    contact_weight = float(distill_cfg.get("contact_weight", 0.0))
+    skate_weight = float(distill_cfg.get("skate_weight", 0.0))
+    constraint_mix = None
+    if "constraint_mix" in train_cfg:
+        constraint_mix = OmegaConf.to_container(train_cfg.constraint_mix, resolve=True)
+    save_step0 = bool(distill_cfg.get("save_step0", True))
+    if args.save_step0:
+        save_step0 = True
+    if args.no_save_step0:
+        save_step0 = False
+
     print_rank0(
         rank,
         f"PD stage {teacher_steps}->{student_steps} | device={device} | "
         f"rank={rank}/{world_size} | batch/gpu={batch_size} accum={grad_accum} "
-        f"global_batch={effective_global} max_frames={train_cfg.max_frames} | "
+        f"global_batch={effective_global} max_frames={train_cfg.max_frames} "
+        f"crop={str(train_cfg.get('frame_crop', 'random'))} | "
         f"text_mode={args.text_mode} text_cache={'on' if use_text_cache else 'off'} | "
-        f"constraint_prob={float(train_cfg.get('constraint_prob', 0.0))} | "
-        f"teacher_dtype={args.teacher_dtype}",
+        f"constraint_prob={float(train_cfg.get('constraint_prob', 0.0))} "
+        f"max_kf={int(train_cfg.get('max_keyframes', 4))} | "
+        f"teacher_dtype={args.teacher_dtype} | "
+        f"match={pd_match_space} snr_γ={snr_gamma:g} "
+        f"w_pd={pd_jump_weight:g} w_diff={diffuse_anchor_weight:g} "
+        f"w_tx0={teacher_x0_weight:g} w_cons={constraint_anchor_weight:g} "
+        f"w_root={root_xz_weight:g} w_ee={ee_pos_weight:g} "
+        f"w_fc={contact_weight:g} w_skate={skate_weight:g}",
     )
 
     # Dataset + text cache BEFORE loading denoisers (LLM2Vec must not share VRAM with PD).
@@ -364,6 +522,7 @@ def main() -> int:
         split_path=args.split_path,
         max_files=args.max_files,
         max_frames=int(train_cfg.max_frames),
+        frame_crop=str(train_cfg.get("frame_crop", "random")),
         fps=int(train_cfg.fps),
         source_fps=float(train_cfg.source_fps),
         motion_rep=cpu_motion_rep,
@@ -548,10 +707,22 @@ def main() -> int:
         "text_mode": args.text_mode,
         "no_text": args.no_text,
         "max_frames": int(train_cfg.max_frames),
+        "frame_crop": str(train_cfg.get("frame_crop", "random")),
         "teacher_checkpoint": str(args.teacher_checkpoint) if args.teacher_checkpoint else None,
         "teacher_dtype": args.teacher_dtype,
         "server": args.server,
         "server_4gpu": args.server_4gpu,
+        "pd_match_space": pd_match_space,
+        "snr_gamma": snr_gamma,
+        "pd_jump_weight": pd_jump_weight,
+        "diffuse_anchor_weight": diffuse_anchor_weight,
+        "teacher_x0_weight": teacher_x0_weight,
+        "constraint_anchor_weight": constraint_anchor_weight,
+        "root_xz_weight": root_xz_weight,
+        "ee_pos_weight": ee_pos_weight,
+        "contact_weight": contact_weight,
+        "skate_weight": skate_weight,
+        "constraint_mix": constraint_mix,
     }
     wandb_logger.init(
         project=args.wandb_project,
@@ -572,6 +743,22 @@ def main() -> int:
     lr_schedule = str(train_cfg.get("lr_schedule", "cosine"))
     min_lr_ratio = float(train_cfg.get("min_lr_ratio", 0.1))
     export_cfg_type = str(cfg.get("cfg_type", "separated"))
+
+    if save_step0 and is_main_process(rank) and args.resume_student_from is None:
+        step0_dir = args.output_dir / "step_0"
+        if not (step0_dir / "model.safetensors").is_file():
+            _export_student_checkpoint(
+                ckpt_dir=step0_dir,
+                bare_student=bare_student,
+                cfg=cfg,
+                stats_path=stats_path,
+                teacher_steps=teacher_steps,
+                student_steps=student_steps,
+                student_init_desc=student_init_desc,
+                export_cfg_type=export_cfg_type,
+            )
+            print_rank0(rank, f"Saved init regression checkpoint {step0_dir}")
+    barrier()
 
     print_rank0(
         rank,
@@ -625,6 +812,17 @@ def main() -> int:
                     cfg_dropout=cfg_dropout,
                     constraint_prob=constraint_prob,
                     max_keyframes=max_keyframes,
+                    constraint_mix=constraint_mix,
+                    pd_match_space=pd_match_space,
+                    snr_gamma=snr_gamma,
+                    pd_jump_weight=pd_jump_weight,
+                    diffuse_anchor_weight=diffuse_anchor_weight,
+                    teacher_x0_weight=teacher_x0_weight,
+                    constraint_anchor_weight=constraint_anchor_weight,
+                    root_xz_weight=root_xz_weight,
+                    ee_pos_weight=ee_pos_weight,
+                    contact_weight=contact_weight,
+                    skate_weight=skate_weight,
                 )
                 loss = loss / grad_accum
             if scaler.is_enabled():
@@ -646,18 +844,36 @@ def main() -> int:
 
         running_loss = 0.9 * running_loss + 0.1 * loss_accum if step > 1 else loss_accum
         if pbar is not None:
-            pbar.set_postfix(loss=f"{loss_accum:.4f}", avg=f"{running_loss:.4f}", lr=f"{lr_now:.2e}")
+            pbar.set_postfix(
+                loss=f"{loss_accum:.2e}",
+                avg=f"{running_loss:.2e}",
+                grad=f"{float(grad_norm):.2e}",
+                lr=f"{lr_now:.2e}",
+            )
 
         if step % log_every == 0 or step == 1:
             elapsed = time.time() - t0
             log_payload = {
                 "loss": loss_accum,
+                "loss_avg": running_loss,
+                "loss_pd": float(metrics_last.get("loss_pd", loss_accum)),
+                "loss_diffuse": float(metrics_last.get("loss_diffuse", 0.0)),
+                "loss_teacher_x0": float(metrics_last.get("loss_teacher_x0", 0.0)),
+                "loss_constraint": float(metrics_last.get("loss_constraint", 0.0)),
+                "loss_root": float(metrics_last.get("loss_root", 0.0)),
+                "loss_ee": float(metrics_last.get("loss_ee", 0.0)),
+                "loss_contact": float(metrics_last.get("loss_contact", 0.0)),
+                "loss_skate": float(metrics_last.get("loss_skate", 0.0)),
+                "constraint_frac": float(metrics_last.get("constraint_frac", 0.0)),
                 "grad_norm": float(grad_norm),
                 "lr": lr_now,
                 "elapsed_sec": elapsed,
                 "t_mean": float(metrics_last["t_mean"]),
                 "x_pred_norm": float(metrics_last["x_pred_norm"]),
                 "x_tgt_norm": float(metrics_last["x_tgt_norm"]),
+                "pred_x0_norm": float(metrics_last.get("pred_x0_norm", 0.0)),
+                "gt_x0_norm": float(metrics_last.get("gt_x0_norm", 0.0)),
+                "snr_w_mean": float(metrics_last.get("snr_w_mean", 1.0)),
                 "teacher_steps": teacher_steps,
                 "student_steps": student_steps,
                 "max_frames": int(train_cfg.max_frames),
@@ -667,8 +883,16 @@ def main() -> int:
             }
             print_rank0(
                 rank,
-                f"[step {step}/{max_steps}] loss={loss_accum:.6f} "
-                f"grad={float(grad_norm):.3f} lr={lr_now:.3e} elapsed={_format_duration(elapsed)}",
+                f"[step {step}/{max_steps}] loss={loss_accum:.3e} avg={running_loss:.3e} "
+                f"pd={float(metrics_last.get('loss_pd', 0)):.3e} "
+                f"diff={float(metrics_last.get('loss_diffuse', 0)):.3e} "
+                f"cons={float(metrics_last.get('loss_constraint', 0)):.3e} "
+                f"root={float(metrics_last.get('loss_root', 0)):.3e} "
+                f"ee={float(metrics_last.get('loss_ee', 0)):.3e} "
+                f"grad={float(grad_norm):.3e} lr={lr_now:.3e} "
+                f"t_mean={float(metrics_last['t_mean']):.1f} "
+                f"x0n={float(metrics_last.get('pred_x0_norm', 0)):.3e} "
+                f"elapsed={_format_duration(elapsed)}",
             )
             wandb_logger.log_step(step, log_payload)
 
@@ -676,28 +900,16 @@ def main() -> int:
             barrier()
             if is_main_process(rank):
                 ckpt_dir = args.output_dir / f"step_{step}"
-                training_export = {
-                    "generative_paradigm": "diffusion",
-                    "num_base_steps": int(cfg.num_base_steps),
-                    "cfg_type": export_cfg_type,
-                    "distill": {
-                        "teacher_steps": teacher_steps,
-                        "student_steps": student_steps,
-                        "recommended_diffusion_steps": student_steps,
-                        "student_init": student_init_desc,
-                    },
-                }
-                save_training_checkpoint(
-                    output_dir=ckpt_dir,
-                    denoiser=bare_student,
-                    denoiser_cfg=OmegaConf.to_container(cfg.denoiser, resolve=True),
-                    training_cfg=training_export,
-                    stats_dir=stats_path,
+                _export_student_checkpoint(
+                    ckpt_dir=ckpt_dir,
+                    bare_student=bare_student,
+                    cfg=cfg,
+                    stats_path=stats_path,
+                    teacher_steps=teacher_steps,
+                    student_steps=student_steps,
+                    student_init_desc=student_init_desc,
+                    export_cfg_type=export_cfg_type,
                 )
-                export_cfg_path = ckpt_dir / "config.yaml"
-                export_cfg = OmegaConf.load(export_cfg_path)
-                export_cfg.recommended_diffusion_steps = student_steps
-                OmegaConf.save(export_cfg, export_cfg_path)
                 print_rank0(rank, f"Saved {ckpt_dir}")
                 wandb_logger.log_checkpoint(step, str(ckpt_dir))
             barrier()

@@ -348,8 +348,18 @@ class EndEffectorConstraintSet:
         # joint_names are constant for all the frames
         rot_joint_names, pos_joint_names = self.skeleton.expand_joint_names(self.joint_names)
         # indexing works for motion_rep with smooth root only (contains pelvis index)
-        self.pos_indices = torch.tensor([self.skeleton.bone_index[jname] for jname in pos_joint_names])
-        self.rot_indices = torch.tensor([self.skeleton.bone_index[jname] for jname in rot_joint_names])
+        # Keep indices on the same device as frame_indices (training may build on CUDA).
+        idx_device = frame_indices.device
+        self.pos_indices = torch.tensor(
+            [self.skeleton.bone_index[jname] for jname in pos_joint_names],
+            device=idx_device,
+            dtype=torch.long,
+        )
+        self.rot_indices = torch.tensor(
+            [self.skeleton.bone_index[jname] for jname in rot_joint_names],
+            device=idx_device,
+            dtype=torch.long,
+        )
 
         # if we pass the full smooth root 3D as input
         if smooth_root_2d is not None and smooth_root_2d.shape[-1] == 3:

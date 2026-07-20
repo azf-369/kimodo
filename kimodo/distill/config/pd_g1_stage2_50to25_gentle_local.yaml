@@ -1,0 +1,83 @@
+# Stage-2 Progressive Distillation (50→25) — gentle finetune recipe.
+#
+# Motivation: copying Stage-1 (100→50) hyperparams onto 50→25 overwrote a
+# strong init (stage_100to50_best). Eval@25 showed step_0 best; later steps
+# hurt root2d_acc / skate. Stage-2 jumps cover larger schedule gaps → use
+# lower LR, shorter run, stronger teacher anchors, softer constraint pressure.
+#
+# Init teacher (frozen) + student copy:
+#   outputs/pd_g1_rp_teacher_seed/stage_100to50_best/step_30000
+#
+# Train:
+#   STAGE1=outputs/pd_g1_rp_teacher_seed/stage_100to50_best/step_30000
+#   python -m kimodo.distill.scripts.train_pd \
+#     --local --recipe pd_g1_stage2_50to25_gentle_local --stage 50to25 \
+#     --teacher-checkpoint "$STAGE1" --teacher-dtype fp32 \
+#     --data-root datasets/bones-seed \
+#     --split-path datasets/kimodo-benchmark/splits/train_split_paths.txt \
+#     --stats-path checkpoints/Kimodo-G1-SEED-v1.hf/stats/motion \
+#     --output-dir outputs/pd_g1_rp_teacher_seed/stage_50to25_gentle \
+#     --device cuda --wandb --wandb-project kimodo-pd-g1 \
+#     --wandb-run-name pd-50to25-gentle
+#
+# Eval often (every 1–2k); pick best by constraint metrics, not last step.
+# Fair baseline: stage_50to25/step_0 or stage_100to50_best @ --steps 25.
+
+training:
+  max_frames: 300
+  frame_crop: random
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  num_workers: 2
+  # Finetune LR: Stage-1 peak was 5e-6 on a cold RP init; Stage-2 starts from
+  # a good 50-step student — lower peak + shorter schedule.
+  lr: 1.5e-6
+  lr_schedule: cosine
+  min_lr_ratio: 0.2
+  warmup_steps: 500
+  weight_decay: 0.0
+  max_steps: 10000
+  grad_clip: 1.0
+  log_every: 20
+  save_every: 1000
+  constraint_prob: 1.0
+  max_keyframes: 6
+  constraint_mix:
+    fullbody: 1.0
+  cfg_dropout:
+    uncond: 0.05
+    text_only: 0.05
+    # Softer than Stage-1 0.25: low-NFE needs more text/dynamics signal.
+    constraint_only: 0.15
+
+distill:
+  teacher_steps: 50
+  student_steps: 25
+  init_student_from_teacher: true
+  amp: true
+  amp_dtype: bfloat16
+  pd_match_space: x0
+  snr_gamma: 5.0
+  pd_jump_weight: 1.0
+  # Less GT x0 pull (coarse 25-step schedule ≠ full diffusion GT fit).
+  diffuse_anchor_weight: 0.25
+  # Stay closer to frozen Stage-1 teacher predictions.
+  teacher_x0_weight: 0.5
+  # Soften sparse constraint MSE vs Stage-1 w_cons=2.
+  constraint_anchor_weight: 1.0
+  root_xz_weight: 0.0
+  ee_pos_weight: 0.0
+  contact_weight: 0.0
+  skate_weight: 0.0
+  save_step0: true
+
+text_cache:
+  enabled: true
+  dir: datasets/bones-seed/cache/llm2vec_g1_train
+  auto_precompute: false
+
+_stage_meta:
+  stage: 50to25
+  parent_recipe: pd_g1_stage1_100to50_local
+  parent_checkpoint: outputs/pd_g1_rp_teacher_seed/stage_100to50_best/step_30000
+  note: gentle finetune; do not copy Stage-1 lr/loss blindly

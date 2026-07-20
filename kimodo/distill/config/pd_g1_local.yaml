@@ -1,6 +1,7 @@
 # Local overrides; prefer --local --formal for production Stage1 on 16GB.
 training:
-  max_frames: 64
+  max_frames: 300
+  frame_crop: random
   batch_size: 1
   gradient_accumulation_steps: 4
   num_workers: 0

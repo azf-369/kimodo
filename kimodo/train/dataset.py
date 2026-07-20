@@ -48,6 +48,7 @@ class G1SeedTrainingDataset(Dataset):
         split_path: str | Path | None = None,
         max_files: Optional[int] = None,
         max_frames: int = 300,
+        frame_crop: str = "random",
         fps: int = 30,
         source_fps: float = 120.0,
         motion_rep: KimodoMotionRep | None = None,
@@ -60,6 +61,10 @@ class G1SeedTrainingDataset(Dataset):
     ):
         self.data_root = Path(data_root)
         self.max_frames = max_frames
+        crop = str(frame_crop).lower().strip()
+        if crop not in {"random", "prefix"}:
+            raise ValueError(f"frame_crop must be 'random' or 'prefix', got {frame_crop!r}")
+        self.frame_crop = crop
         self.fps = fps
         self.source_fps = source_fps
         self.motion_rep = motion_rep
@@ -122,9 +127,15 @@ class G1SeedTrainingDataset(Dataset):
         local_rot_mats = motion["local_rot_mats"]
         root_positions = motion["root_positions"]
 
-        if local_rot_mats.shape[0] > self.max_frames:
-            local_rot_mats = local_rot_mats[: self.max_frames]
-            root_positions = root_positions[: self.max_frames]
+        n_frames = int(local_rot_mats.shape[0])
+        if n_frames > self.max_frames:
+            if self.frame_crop == "random":
+                start = int(torch.randint(0, n_frames - self.max_frames + 1, (1,)).item())
+            else:
+                start = 0
+            end = start + self.max_frames
+            local_rot_mats = local_rot_mats[start:end]
+            root_positions = root_positions[start:end]
 
         feats = self.motion_rep(
             local_rot_mats,

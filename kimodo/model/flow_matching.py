@@ -67,7 +67,9 @@ def apply_motion_constraints(
     """Hard inpainting: overwrite constrained dimensions."""
     if motion_mask is None or observed_motion is None:
         return x
-    return x * (1 - motion_mask) + observed_motion * motion_mask
+    # create_conditions returns a Boolean mask; arithmetic needs float/int.
+    mask = motion_mask.to(dtype=x.dtype)
+    return x * (1 - mask) + observed_motion.to(dtype=x.dtype) * mask
 
 
 class EulerODESolver:

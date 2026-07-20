@@ -11,24 +11,33 @@ distill:
   init_student_from_teacher: true
   amp: true
   amp_dtype: bfloat16
+  # Defaults; formal_* configs override LR/loss recipe.
+  pd_match_space: x0
+  snr_gamma: 5.0
+  pd_jump_weight: 1.0
+  diffuse_anchor_weight: 0.5
+  teacher_x0_weight: 0.2
+  constraint_anchor_weight: 2.0
+  save_step0: true
 
 training:
   fps: 30
   source_fps: 120.0
-  # Small-chunk default (≈2.1s @30fps); override with --max-frames.
-  max_frames: 64
+  # Match official-ish clip length; window with frame_crop (default random).
+  max_frames: 300
+  frame_crop: random
   batch_size: 1
   gradient_accumulation_steps: 4
   num_workers: 2
-  lr: 1.0e-4
+  lr: 1.0e-5
   lr_schedule: cosine
   min_lr_ratio: 0.1
   weight_decay: 0.0
-  warmup_steps: 100
+  warmup_steps: 1000
   max_steps: 10000
   grad_clip: 1.0
   log_every: 20
-  save_every: 2000
+  save_every: 1000
   # Align with official training recipe (text + synthetic constraints + CFG dropout).
   constraint_prob: 0.8
   max_keyframes: 4

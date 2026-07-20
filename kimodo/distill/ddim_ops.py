@@ -106,6 +106,28 @@ def ddim_jump_two(
     return pred_x0 * torch.sqrt(alpha_bar_tm2) + torch.sqrt(1.0 - alpha_bar_tm2) * eps
 
 
+def invert_ddim_jump_two_x0(
+    diffusion: Diffusion,
+    x_t: Tensor,
+    x_tm2: Tensor,
+    t_idx: Tensor,
+) -> Tensor:
+    """Solve for ``pred_x0`` such that ``ddim_jump_two(x_t, pred_x0, t) == x_tm2``.
+
+    Matches Progressive Distillation in the network's native x0 output space, which
+    is better-conditioned than raw noisy-state MSE at high noise.
+    """
+    # alpha_bar after two DDIM steps from t equals alphas_cumprod_prev[t-1].
+    a_tm2 = diffusion.alphas_cumprod_prev[t_idx - 1].clamp(min=1e-8, max=1.0 - 1e-8)
+    A = torch.sqrt(a_tm2)[:, None, None]
+    B = torch.sqrt(1.0 - a_tm2)[:, None, None]
+    Sr = diffusion.sqrt_recip_alphas_cumprod[t_idx][:, None, None]
+    Sm = diffusion.sqrt_recipm1_alphas_cumprod[t_idx][:, None, None].clamp(min=1e-8)
+    denom = A - B / Sm
+    denom = torch.where(denom.abs() < 1e-6, torch.full_like(denom, 1e-6), denom)
+    return (x_tm2 - (B * Sr / Sm) * x_t) / denom
+
+
 def teacher_two_ddim_steps(
     teacher: nn.Module,
     diffusion: Diffusion,

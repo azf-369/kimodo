@@ -124,16 +124,19 @@ class LLM2Vec(nn.Module):
         keys = ["pooling_mode", "max_length", "doc_max_length", "skip_instruction"]
         encoder_args = {key: kwargs.pop(key, None) for key in keys if kwargs.get(key) is not None}
 
-        tokenizer = AutoTokenizer.from_pretrained(base_model_name_or_path)
+        local_only = os.environ.get("HF_HUB_OFFLINE", "0").lower() in ("1", "true", "yes")
+        hf_kwargs = {"local_files_only": local_only}
+
+        tokenizer = AutoTokenizer.from_pretrained(base_model_name_or_path, **hf_kwargs)
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"
 
-        config = AutoConfig.from_pretrained(base_model_name_or_path)
+        config = AutoConfig.from_pretrained(base_model_name_or_path, **hf_kwargs)
         config_class_name = config.__class__.__name__
 
         model_class = cls._get_model_class(config_class_name, enable_bidirectional=enable_bidirectional)
 
-        model = model_class.from_pretrained(base_model_name_or_path, **kwargs)
+        model = model_class.from_pretrained(base_model_name_or_path, **hf_kwargs, **kwargs)
 
         if os.path.isdir(base_model_name_or_path) and os.path.exists(f"{base_model_name_or_path}/config.json"):
             with open(f"{base_model_name_or_path}/config.json", "r") as fIn:
@@ -146,6 +149,7 @@ class LLM2Vec(nn.Module):
             model = PeftModel.from_pretrained(
                 model,
                 base_model_name_or_path,
+                **hf_kwargs,
             )
             model = model.merge_and_unload()
 
@@ -153,6 +157,7 @@ class LLM2Vec(nn.Module):
             model = PeftModel.from_pretrained(
                 model,
                 peft_model_name_or_path,
+                **hf_kwargs,
             )
             if merge_peft:
                 model = model.merge_and_unload()

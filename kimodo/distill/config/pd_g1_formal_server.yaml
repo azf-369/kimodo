@@ -1,34 +1,30 @@
-# Formal Stage1 Progressive Distillation on a single NVIDIA H100 80GB.
-# Merge with: --server  (or --server --formal)
-#
-# VRAM headroom is large vs 4080 16GB:
-#   - longer clips (max_frames=300)
-#   - larger per-GPU batch (no need for heavy grad_accum)
-#   - CUDA text-cache precompute (auto_precompute); do NOT force CPU
-#
-# Effective batch = batch_size * grad_accum = 8 (same as local formal 1×8).
-# Distill LR stays modest because student is initialized from teacher.
+# Formal Stage1 PD on single H100 — v4 constraint-first (match formal_cons losses).
+# Merge with: --server
+# Local formal_cons used batch=1 accum=8; H100 keeps larger micro-batch for throughput.
 
 training:
   max_frames: 300
+  frame_crop: random
   batch_size: 8
   gradient_accumulation_steps: 1
   num_workers: 12
-  lr: 5.0e-5
+  lr: 5.0e-6
   lr_schedule: cosine
   min_lr_ratio: 0.1
-  warmup_steps: 1000
+  warmup_steps: 2000
   weight_decay: 0.0
   max_steps: 30000
   grad_clip: 1.0
   log_every: 20
-  save_every: 2500
-  constraint_prob: 0.8
-  max_keyframes: 4
+  save_every: 1000
+  constraint_prob: 1.0
+  max_keyframes: 6
+  constraint_mix:
+    fullbody: 1.0
   cfg_dropout:
-    uncond: 0.1
-    text_only: 0.1
-    constraint_only: 0.1
+    uncond: 0.05
+    text_only: 0.05
+    constraint_only: 0.25
 
 dataloader:
   pin_memory: true
@@ -41,9 +37,19 @@ distill:
   init_student_from_teacher: true
   amp: true
   amp_dtype: bfloat16
+  pd_match_space: x0
+  snr_gamma: 5.0
+  pd_jump_weight: 1.0
+  diffuse_anchor_weight: 0.5
+  teacher_x0_weight: 0.2
+  constraint_anchor_weight: 2.0
+  root_xz_weight: 0.0
+  ee_pos_weight: 0.0
+  contact_weight: 0.0
+  skate_weight: 0.0
+  save_step0: true
 
 text_encoder:
-  # Used only while building the LLM2Vec cache (not during PD loop if cache hits).
   dtype: float32
   device: auto
 

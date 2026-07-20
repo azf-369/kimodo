@@ -13,6 +13,7 @@ training:
   fps: 30
   source_fps: 120.0
   max_frames: 300
+  frame_crop: random
   batch_size: 4
   num_workers: 2
   lr: 1.0e-4

@@ -1,36 +1,33 @@
-# Formal local training on RTX 4080 SUPER 16GB (proven max_frames=64).
-# Merge with: --local --formal
+# Alias: default --local --formal still points at Stage-1 v4 recipe.
+# Canonical archive name: pd_g1_stage1_100to50_local.yaml
+# Prefer --recipe pd_g1_stage1_100to50_local for new Stage-1 runs.
 #
-# Prerequisites:
-#   1) Empty GPU (no demo / other jobs)
-#   2) Full text cache for the train split (not just --max-files 128)
-#      python -m kimodo.distill.scripts.train_pd --local --precompute-text-only ...
-#
-# Effective batch ≈ batch_size * grad_accum = 8
+# Stage-2: --recipe pd_g1_stage2_50to25_local --stage 50to25
 
 training:
-  max_frames: 64
+  max_frames: 300
+  frame_crop: random
   batch_size: 1
   gradient_accumulation_steps: 8
   num_workers: 2
-  # Distillation LR: lower than scratch FM (1e-4); student starts from teacher.
-  lr: 5.0e-5
+  lr: 5.0e-6
   lr_schedule: cosine
   min_lr_ratio: 0.1
-  warmup_steps: 500
+  warmup_steps: 2000
   weight_decay: 0.0
-  # Stage 100→50 formal budget on one 4080 (adjust if needed).
   max_steps: 30000
   grad_clip: 1.0
   log_every: 20
-  save_every: 2500
-  # Full teacher-aligned conditioning
-  constraint_prob: 0.8
-  max_keyframes: 4
+  save_every: 1000
+  constraint_prob: 1.0
+  max_keyframes: 6
+  # FullBody-only → Stage-1 formal_cons sampling path in constraint_synth.py
+  constraint_mix:
+    fullbody: 1.0
   cfg_dropout:
-    uncond: 0.1
-    text_only: 0.1
-    constraint_only: 0.1
+    uncond: 0.05
+    text_only: 0.05
+    constraint_only: 0.25
 
 distill:
   teacher_steps: 100
@@ -38,6 +35,17 @@ distill:
   init_student_from_teacher: true
   amp: true
   amp_dtype: bfloat16
+  pd_match_space: x0
+  snr_gamma: 5.0
+  pd_jump_weight: 1.0
+  diffuse_anchor_weight: 0.5
+  teacher_x0_weight: 0.2
+  constraint_anchor_weight: 2.0
+  root_xz_weight: 0.0
+  ee_pos_weight: 0.0
+  contact_weight: 0.0
+  skate_weight: 0.0
+  save_step0: true
 
 text_cache:
   enabled: true

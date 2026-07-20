@@ -1,17 +1,13 @@
-# 4x H100 80GB DDP overrides for PD Stage1.
-# Use with: torchrun --standalone --nproc_per_node=4 -m kimodo.distill.scripts.train_pd \
-#            --server --server-4gpu ...
-#
-# Per-GPU batch 8 → global batch = 8 × 4 = 32.
-# Local formal reference: effective batch 8 @ lr 5e-5
-#   sqrt LR scale: 5e-5 * sqrt(32/8) ≈ 1e-4
+# 4x H100 DDP — v4 constraint-first (same losses as formal_cons).
+# lr ≈ 5e-6 * sqrt(32/8) = 1e-5
 
 training:
   max_frames: 300
+  frame_crop: random
   batch_size: 8
   gradient_accumulation_steps: 1
   num_workers: 8
-  lr: 1.0e-4
+  lr: 1.0e-5
   lr_schedule: cosine
   min_lr_ratio: 0.1
   warmup_steps: 2000
@@ -19,13 +15,15 @@ training:
   max_steps: 30000
   grad_clip: 1.0
   log_every: 20
-  save_every: 2500
-  constraint_prob: 0.8
-  max_keyframes: 4
+  save_every: 1000
+  constraint_prob: 1.0
+  max_keyframes: 6
+  constraint_mix:
+    fullbody: 1.0
   cfg_dropout:
-    uncond: 0.1
-    text_only: 0.1
-    constraint_only: 0.1
+    uncond: 0.05
+    text_only: 0.05
+    constraint_only: 0.25
 
 dataloader:
   pin_memory: true
@@ -38,6 +36,17 @@ distill:
   init_student_from_teacher: true
   amp: true
   amp_dtype: bfloat16
+  pd_match_space: x0
+  snr_gamma: 5.0
+  pd_jump_weight: 1.0
+  diffuse_anchor_weight: 0.5
+  teacher_x0_weight: 0.2
+  constraint_anchor_weight: 2.0
+  root_xz_weight: 0.0
+  ee_pos_weight: 0.0
+  contact_weight: 0.0
+  skate_weight: 0.0
+  save_step0: true
 
 text_encoder:
   dtype: float32
@@ -46,5 +55,4 @@ text_encoder:
 text_cache:
   enabled: true
   dir: datasets/bones-seed/cache/llm2vec_g1_train
-  # Rank 0 builds the cache; other ranks wait on a barrier.
   auto_precompute: true
